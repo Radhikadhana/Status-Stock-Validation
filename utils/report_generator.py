@@ -30,6 +30,7 @@ def _normalise_status(status):
 
 
 def _build_article_map(content):
+    """SKU (barcode) -> Article No (GED style)"""
     article_map = {}
     if content.empty or "SKU" not in content.columns:
         return article_map
@@ -48,6 +49,7 @@ def _build_article_map(content):
 
 
 def _build_ecom_map(zecom, mp_name):
+    """Article No -> Ecom Status for the given marketplace."""
     ecom_map = {}
     if zecom.empty or "Article No" not in zecom.columns:
         return ecom_map
@@ -67,38 +69,48 @@ def _build_ecom_map(zecom, mp_name):
 
 def _build_tc_map(tc_inv):
     """
-    Child SKU (GED1708197-01) takes priority over Parent (GED1708197).
-    Returns TC SKU (raw first-column value) along with TC Status and Max 0.
+    barcode SKU -> {TC SKU, TC Status, Max 0}
+
+    FIX RG-1 / RG-2: child/parent priority must be decided by the GED code
+    (TC SKU column, e.g. GED4771311-01) NOT the barcode (SKU column).
+    Barcodes are plain 13-digit numbers and never contain "-".
     """
     tc_map = {}
     parent_fallback = {}
     if tc_inv.empty or "SKU" not in tc_inv.columns:
         return tc_map
+
     for _, r in tc_inv.iterrows():
-        sku = _safe_str(r.get("SKU", ""))
+        sku = _safe_str(r.get("SKU", ""))          # barcode — lookup key
         if not sku:
             continue
+        tc_sku_val = _safe_str(r.get("TC SKU", sku))  # GED code — for child/parent check
         entry = {
-            "TC SKU":    _safe_str(r.get("TC SKU", sku)),
+            "TC SKU":    tc_sku_val,
             "TC Status": _safe_str(r.get("TC Status", "Unknown")),
             "Max 0":     _safe_str(r.get("Max 0", "No")),
         }
-        if "-" in sku:
+        # FIX: check GED code (tc_sku_val) for "-", not barcode (sku)
+        if "-" in tc_sku_val:
+            # Child entry — store directly; derive parent base from GED code
             tc_map[sku] = entry
-            parent_base = sku.rsplit("-", 1)[0]
-            if parent_base not in tc_map:
+            parent_base = tc_sku_val.rsplit("-", 1)[0]   # FIX RG-2
+            if parent_base not in parent_fallback:
                 parent_fallback[parent_base] = entry
         else:
             if sku not in tc_map:
                 tc_map[sku] = entry
+
+    # Fill any parent GED key lookups that have no direct barcode entry
     for parent, entry in parent_fallback.items():
         if parent not in tc_map:
             tc_map[parent] = entry
+
     return tc_map
 
 
 def _build_stock_map(all_df, apply_buffer=False):
-    """Negative TC Stock -> 0. Buffer -1 for Lazada PH / TikTok MY."""
+    """barcode SKU -> {TC Stock, Reserved Stock}. Negative stock clamped to 0."""
     stock_map = {}
     if all_df.empty or "SKU" not in all_df.columns:
         return stock_map
@@ -117,6 +129,7 @@ def _build_stock_map(all_df, apply_buffer=False):
 
 
 def _build_excl_map(exclusion):
+    """Article No -> Exclusion Status"""
     excl_map = {}
     if exclusion is None or exclusion.empty:
         return excl_map
@@ -154,6 +167,46 @@ def _needs_buffer(mp_name):
     return mp_name in ("Lazada PH", "TikTok MY")
 
 
+def _derive_final_status(ecom_st, tc_stock, article_no, excl_map, max_0):
+    """
+    FIX RG-3: derive Final Status (and supporting fields) so the Status Report
+    tab can display meaningful Active / Inactive metrics and a Remarks column.
+    Returns (final_status, comments, remarks, max_action).
+    """
+    # Exclusion override
+    if article_no and article_no in excl_map:
+        excl_status = excl_map[article_no]
+        if excl_status == "Inactive":
+            return "Inactive", "Inactive as per AM Request", "Inactive as per AM Request", "Set max 0"
+        if excl_status == "Active":
+            if tc_stock >= 1:
+                ma = "Remove max" if max_0 == "Yes" else ""
+                return "Active", "Active as per AM Request", "Active as per AM Request", ma
+            else:
+                ma = "Remove max" if max_0 == "Yes" else ""
+                return "Inactive", "AM Request Active but 0 Stock", "AM Request Active but 0 Stock", ma
+
+    # Standard logic
+    ecom_logic = "Inactive" if ecom_st.startswith("Inactive") else ecom_st
+    if ecom_logic == "Inactive":
+        comment = "Due to Ecom No"
+        final   = "Inactive"
+    elif tc_stock == 0:
+        comment = "Due to 0 Stock"
+        final   = "Inactive"
+    else:
+        comment = "Ecom Yes with Stock"
+        final   = "Active"
+
+    max_action = ""
+    if comment == "Due to Ecom No" and max_0 == "No":
+        max_action = "Set max 0"
+    elif comment in ("Due to 0 Stock", "Ecom Yes with Stock") and max_0 == "Yes":
+        max_action = "Remove max"
+
+    return final, comment, comment, max_action
+
+
 def generate_status_report(data, country):
     all_df    = data.get("all_file",  pd.DataFrame())
     tc_inv    = data.get("tc_inv",    pd.DataFrame())
@@ -166,7 +219,7 @@ def generate_status_report(data, country):
     tc_map      = _build_tc_map(tc_inv)
     launch_map  = _build_launch_map(zecom)
 
-    # Build mp_sources dynamically
+    # Build mp_sources dynamically from whichever files were uploaded
     mp_sources = {}
     for key, label in [("lazada", "Lazada " + country),
                        ("shopee", "Shopee " + country),
@@ -192,6 +245,7 @@ def generate_status_report(data, country):
             sku = _safe_str(row.get("SKU", ""))
             if not sku:
                 continue
+
             mp_status  = _safe_str(row.get("MP Status", "Unknown"))
             mp_stock   = _safe_num(row.get("MP Stock", 0))
             article_no = article_map.get(sku, "")
@@ -200,6 +254,30 @@ def generate_status_report(data, country):
             tc_data    = tc_map.get(sku, {"TC SKU": "", "TC Status": "Unknown", "Max 0": "No"})
             sd         = stock_map.get(sku, {"TC Stock": 0.0, "Reserved Stock": 0.0})
             excl_lbl   = excl_map.get(article_no, "") if article_no else ""
+
+            # FIX RG-3: derive Final Status so metrics display correctly
+            final_status, comments, remarks, max_action = _derive_final_status(
+                ecom_st=ecom_st,
+                tc_stock=sd["TC Stock"],
+                article_no=article_no,
+                excl_map=excl_map,
+                max_0=tc_data["Max 0"],
+            )
+
+            mp_norm  = _normalise_status(mp_status)
+            tc_norm  = _normalise_status(tc_data["TC Status"])
+            final_check = (mp_norm == tc_norm == final_status)
+            stock_check = (mp_stock == sd["TC Stock"])
+
+            if not final_check:
+                remarks = "Change to Active" if final_status == "Active" else "Change to Inactive"
+            elif not stock_check:
+                if final_status == "Active":
+                    remarks = "Due to Reserved Stock" if sd["Reserved Stock"] != 0 else "Make Impact"
+                else:
+                    remarks = "Stock not pushed due to Inactive Status"
+            else:
+                remarks = "All Good"
 
             frames.append({
                 "Marketplace":    mp_name,
@@ -216,6 +294,13 @@ def generate_status_report(data, country):
                 "TC Stock":       sd["TC Stock"],
                 "Reserved Stock": sd["Reserved Stock"],
                 "Max 0":          tc_data["Max 0"],
+                # FIX RG-3: added columns so show_df() metrics work correctly
+                "Final Status":   final_status,
+                "Comments":       comments,
+                "Final Check":    str(final_check),
+                "Stock Check":    str(stock_check),
+                "Remarks":        remarks,
+                "Max Setup":      max_action,
             })
 
     return pd.DataFrame(frames) if frames else pd.DataFrame()
