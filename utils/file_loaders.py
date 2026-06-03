@@ -156,7 +156,7 @@ def _parse_shopee_single(raw_bytes, filename_lower):
             df = _normalise_cols(df)
             cols_lower = [c.lower() for c in df.columns]
             if any("sku" in c or "product" in c for c in cols_lower):
-                # Skip rows 4 & 5 after header (indices 0,1,2 in data = original rows 4,5,6)
+                # Skip rows 4 & 5 after header (indices 0,1,2 in data)
                 if len(df) > 3:
                     df = df.iloc[3:].reset_index(drop=True)
                 return df
@@ -179,7 +179,6 @@ def _load_shopee_raw(file):
     file.seek(0)
 
     if name.endswith(".zip"):
-        # Read every file inside the ZIP and consolidate
         frames = []
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -203,12 +202,6 @@ def _load_shopee_raw(file):
 
 
 def load_shopee_stock(file, country):
-    """
-    Load Shopee stock file (ZIP or single file).
-    SKU = Parent SKU / SKU column (13-digit filter applied).
-    Product ID = Product ID column.
-    MP Stock = Stock / Quantity column.
-    """
     df = _load_shopee_raw(file)
     if df.empty:
         return pd.DataFrame()
@@ -248,26 +241,16 @@ def load_shopee_stock(file, country):
 
 
 def load_shopee_status(file, country):
-    """
-    Load Shopee status file (ZIP or single file).
-    MP Status logic:
-      - If Product ID is present (not blank/nan) -> Active
-      - If Product ID is missing/blank          -> Inactive
-    This applies whether or not an explicit MP Status column exists.
-    """
     df = _load_shopee_raw(file)
     if df.empty:
         return pd.DataFrame()
 
-    # Find and clean Product ID column
     pid_col = _find_pid_col(df)
     if pid_col:
         df["Product ID"] = df[pid_col].apply(_clean_sku)
     else:
         df["Product ID"] = ""
 
-    # Derive MP Status from Product ID presence
-    # Product ID present (non-empty, non-nan) -> Active, else -> Inactive
     df["MP Status"] = df["Product ID"].apply(
         lambda x: "Active" if _safe_str(x) not in ("", "nan", "none") else "Inactive"
     )
@@ -367,7 +350,6 @@ def load_zalora_status(file, country):
 
 
 # ── TikTok MY ─────────────────────────────────────────────────────────────────
-# First 2 rows ignored, row 3 = header (index 2), rows 4-5 ignored
 
 def _load_tiktok_raw(file):
     if file is None:
@@ -479,21 +461,17 @@ def load_content(file):
 
 
 # ── TC Inventory ──────────────────────────────────────────────────────────────
-# Child SKU (GED1708197-01) takes priority over Parent SKU (GED1708197)
-# Also returns TC SKU column as-is for output report
 
 def load_tc_inventory(file):
     """
-    TC Inventory column layout (from screenshot):
-      Column 1 = Custom SKU  (13-digit barcode e.g. 4067983507151) -> used as SKU key
-      Column 2 = SKU         (GED code e.g. GED4771311-01)         -> TC SKU for output
+    TC Inventory column layout:
+      Column 1 = Custom SKU  (13-digit barcode) -> used as SKU key
+      Column 2 = SKU         (GED code)         -> TC SKU for output
       Other    = Item status, Max Quantity, etc.
 
     Child/Parent priority:
-      Child  = SKU contains "-"  e.g. GED4771311-01
-      Parent = SKU without  "-"  e.g. GED4771311
-      If a Custom SKU maps to both a child and parent entry,
-      the child entry is preferred.
+      Child  = GED SKU contains "-"  e.g. GED4771311-01
+      Parent = GED SKU without  "-"  e.g. GED4771311
     """
     if file is None:
         return pd.DataFrame()
@@ -519,35 +497,31 @@ def load_tc_inventory(file):
     df = df.reset_index(drop=True)
     actual_cols = list(df.columns)
 
-    # ── Column 1: Custom SKU (barcode) — used as the lookup key ──────────────
-    # This is always the first column
+    # Column 1: Custom SKU (barcode) — used as the lookup key
     custom_sku_col = None
     for c in ["Custom SKU", "CustomSKU", "Barcode", "EAN"]:
         if c in actual_cols:
             custom_sku_col = c
             break
     if custom_sku_col is None:
-        # Fall back to first column
         custom_sku_col = actual_cols[0] if actual_cols else None
 
-    # ── Column 2: SKU (GED code) — shown in output as TC SKU ─────────────────
-    # This is always the second column (the GED parent/child code)
+    # Column 2: SKU (GED code) — shown in output as TC SKU
     ged_sku_col = None
     for c in ["SKU", "Sku", "sku"]:
         if c in actual_cols and c != custom_sku_col:
             ged_sku_col = c
             break
     if ged_sku_col is None:
-        # Fall back to second column
         if len(actual_cols) > 1:
             ged_sku_col = actual_cols[1]
         else:
             ged_sku_col = custom_sku_col
 
-    # ── Status column ─────────────────────────────────────────────────────────
+    # Status column
     status_col = None
     for c in ["Item status", "Item Status", "Status", "TC Status",
-               "ItemStatus", "item status"]:
+              "ItemStatus", "item status"]:
         if c in actual_cols:
             status_col = c
             break
@@ -557,10 +531,10 @@ def load_tc_inventory(file):
                 status_col = c
                 break
 
-    # ── Max Quantity column ───────────────────────────────────────────────────
+    # Max Quantity column
     max_col = None
     for c in ["Max Quantity", "MaxQuantity", "Max", "Maximum Quantity",
-               "max_quantity", "max quantity"]:
+              "max_quantity", "max quantity"]:
         if c in actual_cols:
             max_col = c
             break
@@ -570,11 +544,8 @@ def load_tc_inventory(file):
                 max_col = c
                 break
 
-    # ── Build output DataFrame ────────────────────────────────────────────────
     out = pd.DataFrame()
-    # SKU = Custom SKU (barcode) used as join key with marketplace files
     out["SKU"]       = df[custom_sku_col].apply(_clean_sku) if custom_sku_col else ""
-    # TC SKU = GED code from second column, shown in output report
     out["TC SKU"]    = df[ged_sku_col].apply(_safe_str) if ged_sku_col else ""
     out["TC Status"] = df[status_col].apply(_safe_str) if status_col else "Unknown"
     if max_col:
@@ -588,11 +559,9 @@ def load_tc_inventory(file):
 
     out = out[out["SKU"] != ""].copy()
 
-    # ── Child/Parent deduplication ────────────────────────────────────────────
-    # If same Custom SKU (barcode) maps to both a child GED code (with "-")
-    # and a parent GED code (without "-"), keep the child entry.
+    # Child/Parent deduplication — child (GED code with "-") takes priority
     out["_is_child"] = out["TC SKU"].str.contains("-", na=False).astype(int)
-    out = out.sort_values("_is_child", ascending=False)  # child first
+    out = out.sort_values("_is_child", ascending=False)
     out = out.drop_duplicates(subset=["SKU"], keep="first")
     out = out.drop(columns=["_is_child"])
     out = out.reset_index(drop=True)
@@ -601,9 +570,6 @@ def load_tc_inventory(file):
 
 
 # ── zEcom ─────────────────────────────────────────────────────────────────────
-# PH  -> Article No column = "PIM Article#", header row 3 (index 2)
-# MY  -> Article No column = "Style#",       header row 4 (index 3)
-# SG  -> Article No column = "STYLE#",       header row 4 (index 3)
 
 def load_zecom(file, country="PH"):
     if file is None:
