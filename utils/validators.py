@@ -38,7 +38,7 @@ def _is_valid_sku(sku):
 # ── Lookup builders ───────────────────────────────────────────────────────────
 
 def _build_article_map(content):
-    """SKU -> Article No"""
+    """barcode SKU -> Article No"""
     article_map = {}
     if content.empty or "SKU" not in content.columns:
         return article_map
@@ -77,39 +77,38 @@ def _build_ecom_map(zecom, mp_name):
 
 def _build_tc_map(tc_inv):
     """
-    SKU -> {TC SKU, TC Status, Max 0}
-    Child SKU (e.g. GED1708197-01) takes priority over Parent SKU (GED1708197).
-    If only parent exists, it is used as fallback for child lookups.
-    TC SKU = the raw SKU value from the TC inventory file (first column).
+    barcode SKU -> {TC SKU, TC Status, Max 0}
+
+    FIX V-1: child/parent priority is decided by the GED code (TC SKU column,
+    e.g. GED4771311-01), NOT the barcode (SKU column).
+    Barcodes are 13-digit numbers and never contain "-".
     """
     tc_map = {}
-    parent_fallback = {}  # parent_base -> entry (used when child not found)
+    parent_fallback = {}
 
     if tc_inv.empty or "SKU" not in tc_inv.columns:
         return tc_map
 
     for _, r in tc_inv.iterrows():
-        sku = _safe_str(r.get("SKU", ""))
+        sku = _safe_str(r.get("SKU", ""))              # barcode — lookup key
         if not sku:
             continue
-        tc_sku_raw = _safe_str(r.get("TC SKU", sku))
+        tc_sku_val = _safe_str(r.get("TC SKU", sku))  # GED code — child/parent check
         entry = {
-            "TC SKU":    tc_sku_raw,
+            "TC SKU":    tc_sku_val,
             "TC Status": _safe_str(r.get("TC Status", "Unknown")),
             "Max 0":     _safe_str(r.get("Max 0", "No")),
         }
-        if "-" in sku:
-            # Child SKU — store directly and register as fallback for parent
+        # FIX V-1: use GED code (tc_sku_val) to determine child vs parent
+        if "-" in tc_sku_val:
             tc_map[sku] = entry
-            parent_base = sku.rsplit("-", 1)[0]
-            if parent_base not in tc_map:
+            parent_base = tc_sku_val.rsplit("-", 1)[0]
+            if parent_base not in parent_fallback:
                 parent_fallback[parent_base] = entry
         else:
-            # Parent SKU — only store if not already set by a child
             if sku not in tc_map:
                 tc_map[sku] = entry
 
-    # Fill parent SKUs that have no direct entry but have a child fallback
     for parent, entry in parent_fallback.items():
         if parent not in tc_map:
             tc_map[parent] = entry
@@ -119,9 +118,8 @@ def _build_tc_map(tc_inv):
 
 def _build_stock_map(all_df, apply_buffer=False):
     """
-    SKU -> {TC Stock, Reserved Stock}
-    - Negative TC Stock is clamped to 0 before any logic.
-    - apply_buffer=True (Lazada PH, TikTok MY): TC Stock = max(stock - 1, 0)
+    barcode SKU -> {TC Stock, Reserved Stock}
+    Negative TC Stock clamped to 0. Buffer -1 for Lazada PH / TikTok MY.
     """
     stock_map = {}
     if all_df.empty or "SKU" not in all_df.columns:
@@ -130,9 +128,9 @@ def _build_stock_map(all_df, apply_buffer=False):
         sku = _safe_str(r.get("SKU", ""))
         if sku and sku not in stock_map:
             tc = _safe_num(r.get("TC Stock", 0))
-            tc = max(tc, 0)          # negative -> 0
+            tc = max(tc, 0)
             if apply_buffer:
-                tc = max(tc - 1, 0)  # buffer -1
+                tc = max(tc - 1, 0)
             stock_map[sku] = {
                 "TC Stock":       tc,
                 "Reserved Stock": _safe_num(r.get("Reserved Stock", 0)),
@@ -202,9 +200,6 @@ def _apply_exclusion(article_no, tc_stock, excl_map, max_0):
 
 def _sku_logic(mp_status, mp_stock, ecom_status, tc_status,
                tc_stock, reserved, max_0, article_no, excl_map):
-    """
-    ecom_status here is the normalised value (Inactive for future launch too).
-    """
     excl = _apply_exclusion(article_no, tc_stock, excl_map, max_0)
     if excl:
         final_status, comment, max_action = excl
@@ -227,9 +222,8 @@ def _sku_logic(mp_status, mp_stock, ecom_status, tc_status,
 
     mp_norm  = _normalise_status(mp_status)
     tc_norm  = _normalise_status(tc_status)
-    fin_norm = final_status
 
-    final_check = (mp_norm == tc_norm == fin_norm)
+    final_check = (mp_norm == tc_norm == final_status)
     stock_check = (mp_stock == tc_stock)
 
     if not final_check:
@@ -294,7 +288,6 @@ def run_sku_validation(data, country):
             excl_lbl   = excl_map.get(article_no, "") if article_no else ""
             launch_dt  = launch_map.get(article_no, "") if article_no else ""
 
-            # Invalid SKU check — must be exactly 13 digits
             if not _is_valid_sku(sku):
                 rows.append({
                     "Marketplace":    mp_name,
@@ -321,7 +314,6 @@ def run_sku_validation(data, country):
                 })
                 continue
 
-            # Normalise ecom for logic: future launch = Inactive for logic
             ecom_for_logic = "Inactive" if ecom_st.startswith("Inactive") else ecom_st
 
             result = _sku_logic(
@@ -356,7 +348,7 @@ def run_sku_validation(data, country):
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-# ── PID-level logic (Shopee + TikTok) ────────────────────────────────────────
+# ── PID-level validation (Shopee + TikTok) ───────────────────────────────────
 
 def run_pid_validation(data, country):
     """
@@ -398,12 +390,15 @@ def run_pid_validation(data, country):
         enriched = []
         for _, r in df.iterrows():
             sku       = _safe_str(r.get("SKU", ""))
-            pid       = _safe_str(r.get("Product ID", sku))
+            # FIX V-3: always coerce Product ID to clean string; fall back to SKU
+            raw_pid   = r.get("Product ID", "")
+            pid       = _safe_str(raw_pid)
+            if pid == "":
+                pid = sku
             mp_status = _safe_str(r.get("MP Status", "Unknown"))
             mp_stock  = _safe_num(r.get("MP Stock", 0))
             art       = article_map.get(sku, "")
             ecom_st   = ecom_map.get(art, "Inactive") if art else "Inactive"
-            # Normalise ecom for logic
             ecom_logic = "Inactive" if ecom_st.startswith("Inactive") else ecom_st
             td        = tc_map.get(sku, {"TC SKU": "", "TC Status": "Unknown", "Max 0": "No"})
             sd        = stock_map.get(sku, {"TC Stock": 0.0, "Reserved Stock": 0.0})
@@ -412,7 +407,7 @@ def run_pid_validation(data, country):
             sku_valid = _is_valid_sku(sku)
             enriched.append({
                 "SKU":            sku,
-                "Product ID":     pid,
+                "Product ID":     pid,         # always a clean string
                 "MP Status":      mp_status,
                 "MP Stock":       mp_stock,
                 "Article No":     art,
@@ -434,21 +429,24 @@ def run_pid_validation(data, country):
 
         # ── Step 2: Dual Status per Product ID ───────────────────────────
         dual_map = {}
-        for pid, grp in enriched_df.groupby("Product ID", dropna=False):
+        for pid_key, grp in enriched_df.groupby("Product ID", dropna=False):
+            pid_str = _safe_str(pid_key)
             statuses = set(grp["Ecom Logic"].unique())
-            dual_map[_safe_str(pid)] = (
+            dual_map[pid_str] = (
                 2 if ("Active" in statuses and "Inactive" in statuses) else 1
             )
 
         # ── Step 3: Consolidated TC Stock per Product ID ──────────────────
-        consolidated_map = (
-            enriched_df.groupby("Product ID")["TC Stock"].sum().to_dict()
-        )
+        # FIX V-2: use dropna=False so keys match dual_map exactly
+        consolidated_map = {}
+        for pid_key, grp in enriched_df.groupby("Product ID", dropna=False):
+            pid_str = _safe_str(pid_key)
+            consolidated_map[pid_str] = float(grp["TC Stock"].sum())
 
         # ── Step 4: Per-SKU output row ────────────────────────────────────
         for _, r in enriched_df.iterrows():
             sku         = r["SKU"]
-            pid         = r["Product ID"]
+            pid         = r["Product ID"]       # already a clean string
             mp_status   = r["MP Status"]
             mp_stock    = r["MP Stock"]
             article_no  = r["Article No"]
@@ -540,9 +538,8 @@ def run_pid_validation(data, country):
             # ── Final Check & Stock Check ─────────────────────────────────
             mp_norm  = _normalise_status(mp_status)
             tc_norm  = _normalise_status(tc_status)
-            fin_norm = final_status
 
-            final_check = (mp_norm == tc_norm == fin_norm)
+            final_check = (mp_norm == tc_norm == final_status)
             stock_check = (mp_stock == tc_stock)
 
             # ── Remarks ───────────────────────────────────────────────────
