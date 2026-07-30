@@ -16,23 +16,25 @@ def _safe_str(val):
     return str(val).strip()
 
 
-def _read_file(file, header_row=0, skiprows=None):
+def _read_file(file, header_row=0, skiprows=None, usecols=None):
     if file is None:
         return pd.DataFrame()
     name = file.name.lower()
-    raw  = file.read()
-    file.seek(0)
     try:
+        file.seek(0)
+        raw_bytes = file.read()
+        file.seek(0)
+        bio = io.BytesIO(raw_bytes)
         if name.endswith(".csv"):
-            return pd.read_csv(io.BytesIO(raw), header=header_row,
-                               skiprows=skiprows, dtype=str)
+            return pd.read_csv(bio, header=header_row,
+                             skiprows=skiprows, dtype=str, usecols=usecols)
         try:
             import python_calamine
-            return pd.read_excel(io.BytesIO(raw), header=header_row,
-                                 skiprows=skiprows, dtype=str, engine="calamine")
+            return pd.read_excel(bio, header=header_row,
+                               skiprows=skiprows, dtype=str, engine="calamine", usecols=usecols)
         except ImportError:
-            return pd.read_excel(io.BytesIO(raw), header=header_row,
-                                 skiprows=skiprows, dtype=str)
+            return pd.read_excel(bio, header=header_row,
+                               skiprows=skiprows, dtype=str, usecols=usecols)
     except Exception:
         return pd.DataFrame()
 
@@ -79,13 +81,22 @@ def _clean_sku(val):
 def _filter_13digit_skus(df, sku_col):
     if sku_col not in df.columns:
         return df
+    
+    import numpy as np
+    def clean_ser(ser):
+        s = ser.fillna("").astype(str).str.strip()
+        float_mask = s.str.match(r'^\d+\.0$', na=False)
+        return np.where(float_mask, s.str[:-2], s)
+
     parent_cols = [c for c in df.columns
                    if "parent" in c.lower() and "sku" in c.lower()]
     if parent_cols:
         df = df.copy()
-        mask_blank = df[sku_col].apply(_clean_sku) == ""
+        cleaned_sku = clean_ser(df[sku_col])
+        mask_blank = cleaned_sku == ""
         df.loc[mask_blank, sku_col] = df.loc[mask_blank, parent_cols[0]]
-    df[sku_col] = df[sku_col].apply(_clean_sku)
+        
+    df[sku_col] = clean_ser(df[sku_col])
     df = df[df[sku_col].str.fullmatch(r'\d{13}', na=False)].copy()
     return df
 
@@ -109,7 +120,26 @@ def _ecom_status_from_val(val, future_launch):
 def load_lazada(file, country):
     if file is None:
         return pd.DataFrame()
-    df = _read_file(file, header_row=0)
+    
+    # Read the header first to find the matching column names
+    file.seek(0)
+    if file.name.lower().endswith(".csv"):
+        header_df = pd.read_csv(file, nrows=1)
+    else:
+        try:
+            import python_calamine
+            header_df = pd.read_excel(file, nrows=1, engine="calamine")
+        except ImportError:
+            header_df = pd.read_excel(file, nrows=1)
+    file.seek(0)
+    
+    actual_cols = list(header_df.columns)
+    usecols = []
+    for c in ["SellerSKU", "Quantity", "status"]:
+        if c in actual_cols:
+            usecols.append(c)
+            
+    df = _read_file(file, header_row=0, usecols=usecols if usecols else None)
     if df.empty:
         return pd.DataFrame()
     df = _normalise_cols(df)
@@ -125,7 +155,9 @@ def load_lazada(file, country):
         df["MP Stock"] = pd.to_numeric(
             df["MP Stock"].apply(_safe_str), errors="coerce"
         ).fillna(0)
-    return df
+    # Slice only needed columns to keep memory low
+    keep_cols = [c for c in ["SKU", "MP Stock", "MP Status", "Marketplace"] if c in df.columns]
+    return df[keep_cols].copy()
 
 
 # ── Shopee ────────────────────────────────────────────────────────────────────
@@ -170,9 +202,26 @@ def _parse_shopee_single(raw_bytes, filename_lower):
     """
     import warnings
 
+    # Identify matching columns from header at row index 2
+    usecols = None
+    try:
+        if filename_lower.endswith(".csv"):
+            header_df = pd.read_csv(io.BytesIO(raw_bytes), header=2, nrows=1)
+        else:
+            try:
+                import python_calamine
+                header_df = pd.read_excel(io.BytesIO(raw_bytes), header=2, nrows=1, engine="calamine")
+            except ImportError:
+                header_df = pd.read_excel(io.BytesIO(raw_bytes), header=2, nrows=1)
+        cols = list(header_df.columns)
+        # Keep only columns containing relevant keywords to keep memory minimal
+        usecols = [c for c in cols if any(kw in c.lower() for kw in ["sku", "product", "stock", "quantity", "qty", "available", "current", "parent", "status"])]
+    except Exception:
+        pass
+
     if filename_lower.endswith(".csv"):
         try:
-            df = pd.read_csv(io.BytesIO(raw_bytes), header=2, dtype=str)
+            df = pd.read_csv(io.BytesIO(raw_bytes), header=2, dtype=str, usecols=usecols)
             df = _normalise_cols(df)
             df = df.iloc[3:].reset_index(drop=True)
             df = df.dropna(how="all").reset_index(drop=True)
@@ -198,6 +247,7 @@ def _parse_shopee_single(raw_bytes, filename_lower):
                     header=2,
                     dtype=str,
                     engine=engine,
+                    usecols=usecols
                 )
             if df is None or df.empty:
                 continue
@@ -237,6 +287,12 @@ def _parse_shopee_single(raw_bytes, filename_lower):
         df = df.astype(str)
         df = df.replace("None", "")
         df = _normalise_cols(df)
+        
+        # Apply the same usecols filter to the fallback dataframe to save memory
+        if usecols:
+            keep_cols = [c for c in df.columns if c in usecols]
+            df = df[keep_cols].copy()
+            
         df = df.dropna(how="all").reset_index(drop=True)
         cols_lower = [c.lower() for c in df.columns]
         if (any("sku" in c for c in cols_lower) or
@@ -381,7 +437,9 @@ def load_shopee_stock(file, country):
     else:
         df["MP Stock"] = 0.0
 
-    return df
+    # Slice only needed columns to keep memory low
+    keep_cols = [c for c in ["SKU", "Product ID", "MP Stock", "Marketplace"] if c in df.columns]
+    return df[keep_cols].copy()
 
 
 def load_shopee_status(file, country):
@@ -462,13 +520,50 @@ def load_shopee_status(file, country):
         df["SKU"] = ""
 
     df["Marketplace"] = "Shopee " + country
-    return df.reset_index(drop=True)
+    # Slice only needed columns to keep memory low
+    keep_cols = [c for c in ["SKU", "Product ID", "MP Status", "Marketplace"] if c in df.columns]
+    return df[keep_cols].copy()
 
 
 def load_zalora_stock(file, country):
     if file is None:
         return pd.DataFrame()
-    df = _read_file(file)
+    
+    file.seek(0)
+    if file.name.lower().endswith(".csv"):
+        header_df = pd.read_csv(file, nrows=1)
+    else:
+        try:
+            import python_calamine
+            header_df = pd.read_excel(file, nrows=1, engine="calamine")
+        except ImportError:
+            header_df = pd.read_excel(file, nrows=1)
+    file.seek(0)
+    
+    actual_cols = list(header_df.columns)
+    usecols = []
+    
+    sku_col = None
+    for c in ["SellerSku", "SellerSKU", "Seller Sku", "Seller SKU", "SKU"]:
+        if c in actual_cols:
+            sku_col = c
+            break
+    if sku_col is None:
+        for c in actual_cols:
+            if "sku" in c.lower() or "seller" in c.lower():
+                sku_col = c
+                break
+                
+    qty_col = None
+    for c in ["Quantity", "Stock", "MP Stock", "quantity", "stock"]:
+        if c in actual_cols:
+            qty_col = c
+            break
+            
+    if sku_col: usecols.append(sku_col)
+    if qty_col: usecols.append(qty_col)
+    
+    df = _read_file(file, usecols=usecols if usecols else None)
     if df.empty:
         return pd.DataFrame()
     df = _normalise_cols(df)
@@ -502,13 +597,55 @@ def load_zalora_stock(file, country):
         ).fillna(0)
     else:
         df["MP Stock"] = 0.0
-    return df
+    # Slice only needed columns to keep memory low
+    keep_cols = [c for c in ["SKU", "MP Stock", "Marketplace"] if c in df.columns]
+    return df[keep_cols].copy()
 
 
 def load_zalora_status(file, country):
     if file is None:
         return pd.DataFrame()
-    df = _read_file(file)
+        
+    file.seek(0)
+    if file.name.lower().endswith(".csv"):
+        header_df = pd.read_csv(file, nrows=1)
+    else:
+        try:
+            import python_calamine
+            header_df = pd.read_excel(file, nrows=1, engine="calamine")
+        except ImportError:
+            header_df = pd.read_excel(file, nrows=1)
+    file.seek(0)
+    
+    actual_cols = list(header_df.columns)
+    usecols = []
+    
+    sku_col = None
+    for c in ["SellerSku", "SellerSKU", "Seller Sku", "Seller SKU", "SKU"]:
+        if c in actual_cols:
+            sku_col = c
+            break
+    if sku_col is None:
+        for c in actual_cols:
+            if "sku" in c.lower() or "seller" in c.lower():
+                sku_col = c
+                break
+                
+    status_col = None
+    for c in ["Status", "MP Status", "status", "mp_status"]:
+        if c in actual_cols:
+            status_col = c
+            break
+    if status_col is None:
+        for c in actual_cols:
+            if "status" in c.lower():
+                status_col = c
+                break
+                
+    if sku_col: usecols.append(sku_col)
+    if status_col: usecols.append(status_col)
+    
+    df = _read_file(file, usecols=usecols if usecols else None)
     if df.empty:
         return pd.DataFrame()
     df = _normalise_cols(df)
@@ -544,7 +681,10 @@ def load_zalora_status(file, country):
         df["MP Status"] = "Unknown"
     df["SKU"] = df["SKU"].apply(_clean_sku)
     df["Marketplace"] = "Zalora " + country
-    return df[df["SKU"] != ""].copy()
+    df = df[df["SKU"] != ""].copy()
+    # Slice only needed columns to keep memory low
+    keep_cols = [c for c in ["SKU", "MP Status", "Marketplace"] if c in df.columns]
+    return df[keep_cols].copy()
 
 
 # ── TikTok MY ─────────────────────────────────────────────────────────────────
@@ -634,7 +774,42 @@ def load_tiktok(active_file, inactive_file):
 def load_content(file):
     if file is None:
         return pd.DataFrame()
-    df = _read_file(file)
+        
+    file.seek(0)
+    if file.name.lower().endswith(".csv"):
+        header_df = pd.read_csv(file, nrows=1)
+    else:
+        try:
+            import python_calamine
+            header_df = pd.read_excel(file, nrows=1, engine="calamine")
+        except ImportError:
+            header_df = pd.read_excel(file, nrows=1)
+    file.seek(0)
+    
+    actual_cols = list(header_df.columns)
+    
+    sku_col = None
+    if "SKU" in actual_cols:
+        sku_col = "SKU"
+    elif "EAN" in actual_cols:
+        sku_col = "EAN"
+        
+    art_col = None
+    for c in ["Article No", "Color_No", "Color_No.1", "ArticleNo", "Article Number"]:
+        if c in actual_cols:
+            art_col = c
+            break
+    if art_col is None:
+        for c in actual_cols:
+            if "article" in c.lower() or "color" in c.lower():
+                art_col = c
+                break
+                
+    usecols = []
+    if sku_col: usecols.append(sku_col)
+    if art_col: usecols.append(art_col)
+    
+    df = _read_file(file, usecols=usecols if usecols else None)
     if df.empty:
         return pd.DataFrame()
     df = _normalise_cols(df)
@@ -656,7 +831,9 @@ def load_content(file):
         df["SKU"] = df["SKU"].apply(_clean_sku)
     if "Article No" in df.columns:
         df["Article No"] = df["Article No"].apply(_safe_str)
-    return df
+    # Slice only needed columns to keep memory low
+    keep_cols = [c for c in ["SKU", "Article No"] if c in df.columns]
+    return df[keep_cols].copy()
 
 
 # ── TC Inventory ──────────────────────────────────────────────────────────────
@@ -678,18 +855,18 @@ def load_tc_inventory(file):
     """
     if file is None:
         return pd.DataFrame()
-    raw  = file.read()
+    raw = file.read()
     name = file.name.lower()
     file.seek(0)
     try:
         if name.endswith(".csv"):
-            raw_df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+            raw_df = pd.read_csv(io.BytesIO(raw), header=None, nrows=10, dtype=str)
         else:
             try:
                 import python_calamine
-                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, engine="calamine")
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, nrows=10, dtype=str, engine="calamine")
             except ImportError:
-                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, nrows=10, dtype=str)
     except Exception:
         return pd.DataFrame()
 
@@ -707,84 +884,99 @@ def load_tc_inventory(file):
         if non_empty > 2 and header_idx == 0:
             header_idx = i
 
-    df = raw_df.iloc[header_idx + 1:].copy()
-    df.columns = [_safe_str(x) for x in raw_df.iloc[header_idx]]
+    header_row_vals = [_safe_str(x) for x in raw_df.iloc[header_idx]]
+    
+    custom_sku_col_idx = 0
+    for idx, c in enumerate(header_row_vals):
+        if c in ["Custom SKU", "CustomSKU", "Barcode", "EAN"]:
+            custom_sku_col_idx = idx
+            break
+            
+    ged_sku_col_idx = 1 if len(header_row_vals) > 1 else 0
+    for idx, c in enumerate(header_row_vals):
+        if c in ["SKU", "Sku", "sku"] and idx != custom_sku_col_idx:
+            ged_sku_col_idx = idx
+            break
+            
+    status_col_idx = None
+    for idx, c in enumerate(header_row_vals):
+        if c in ["Item status", "Item Status", "Status", "TC Status", "ItemStatus", "item status"]:
+            status_col_idx = idx
+            break
+    if status_col_idx is None:
+        for idx, c in enumerate(header_row_vals):
+            if "status" in c.lower() and idx not in (custom_sku_col_idx, ged_sku_col_idx):
+                status_col_idx = idx
+                break
+                
+    max_col_idx = None
+    for idx, c in enumerate(header_row_vals):
+        if c in ["Max Quantity", "MaxQuantity", "Max", "Maximum Quantity", "max_quantity", "max quantity"]:
+            max_col_idx = idx
+            break
+    if max_col_idx is None:
+        for idx, c in enumerate(header_row_vals):
+            if "max" in c.lower() and idx not in (custom_sku_col_idx, ged_sku_col_idx, status_col_idx):
+                max_col_idx = idx
+                break
+                
+    usecols_indices = [custom_sku_col_idx, ged_sku_col_idx]
+    if status_col_idx is not None:
+        usecols_indices.append(status_col_idx)
+    if max_col_idx is not None:
+        usecols_indices.append(max_col_idx)
+    usecols_indices = sorted(list(set(usecols_indices)))
+    
+    try:
+        if name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw), header=None, skiprows=header_idx + 1, usecols=usecols_indices, dtype=str)
+        else:
+            try:
+                import python_calamine
+                df = pd.read_excel(io.BytesIO(raw), header=None, skiprows=header_idx + 1, usecols=usecols_indices, dtype=str, engine="calamine")
+            except ImportError:
+                df = pd.read_excel(io.BytesIO(raw), header=None, skiprows=header_idx + 1, usecols=usecols_indices, dtype=str)
+    except Exception:
+        return pd.DataFrame()
+        
+    if df.empty:
+        return pd.DataFrame()
+
+    col_mapping = {}
+    for idx in usecols_indices:
+        col_mapping[idx] = header_row_vals[idx]
+    df = df.rename(columns=col_mapping)
     df = df.loc[:, ~df.columns.duplicated()].copy()
     df = df.reset_index(drop=True)
-    actual_cols = list(df.columns)
+    
+    custom_sku_col = header_row_vals[custom_sku_col_idx]
+    ged_sku_col = header_row_vals[ged_sku_col_idx]
+    status_col = header_row_vals[status_col_idx] if status_col_idx is not None else None
+    max_col = header_row_vals[max_col_idx] if max_col_idx is not None else None
 
-    # ── Column 1: Custom SKU (barcode) — used as the lookup key ──────────────
-    # This is always the first column
-    custom_sku_col = None
-    for c in ["Custom SKU", "CustomSKU", "Barcode", "EAN"]:
-        if c in actual_cols:
-            custom_sku_col = c
-            break
-    if custom_sku_col is None:
-        # Fall back to first column
-        custom_sku_col = actual_cols[0] if actual_cols else None
-
-    # ── Column 2: SKU (GED code) — shown in output as TC SKU ─────────────────
-    # This is always the second column (the GED parent/child code)
-    ged_sku_col = None
-    for c in ["SKU", "Sku", "sku"]:
-        if c in actual_cols and c != custom_sku_col:
-            ged_sku_col = c
-            break
-    if ged_sku_col is None:
-        # Fall back to second column
-        if len(actual_cols) > 1:
-            ged_sku_col = actual_cols[1]
-        else:
-            ged_sku_col = custom_sku_col
-
-    # ── Status column ─────────────────────────────────────────────────────────
-    status_col = None
-    for c in ["Item status", "Item Status", "Status", "TC Status",
-               "ItemStatus", "item status"]:
-        if c in actual_cols:
-            status_col = c
-            break
-    if status_col is None:
-        for c in actual_cols:
-            if "status" in c.lower() and c not in (custom_sku_col, ged_sku_col):
-                status_col = c
-                break
-
-    # ── Max Quantity column ───────────────────────────────────────────────────
-    max_col = None
-    for c in ["Max Quantity", "MaxQuantity", "Max", "Maximum Quantity",
-               "max_quantity", "max quantity"]:
-        if c in actual_cols:
-            max_col = c
-            break
-    if max_col is None:
-        for c in actual_cols:
-            if "max" in c.lower() and c not in (custom_sku_col, ged_sku_col, status_col):
-                max_col = c
-                break
-
-    # ── Build output DataFrame ────────────────────────────────────────────────
+    # Build output DataFrame
+    import numpy as np
     out = pd.DataFrame()
-    # SKU = Custom SKU (barcode) used as join key with marketplace files
-    out["SKU"]       = df[custom_sku_col].apply(_clean_sku) if custom_sku_col else ""
-    # TC SKU = GED code from second column, shown in output report
-    out["TC SKU"]    = df[ged_sku_col].apply(_safe_str) if ged_sku_col else ""
-    out["TC Status"] = df[status_col].apply(_safe_str) if status_col else "Unknown"
-    if max_col:
-        out["Max Quantity"] = df[max_col].apply(_safe_str)
-        out["Max 0"] = out["Max Quantity"].apply(
-            lambda x: "Yes" if _safe_str(x) == "0" else "No"
-        )
+    if custom_sku_col in df.columns:
+        s_sku = df[custom_sku_col].fillna("").astype(str).str.strip()
+        float_mask = s_sku.str.match(r'^\d+\.0$', na=False)
+        out["SKU"] = np.where(float_mask, s_sku.str[:-2], s_sku)
+    else:
+        out["SKU"] = ""
+        
+    out["TC SKU"] = df[ged_sku_col].fillna("").astype(str).str.strip() if ged_sku_col in df.columns else ""
+    out["TC Status"] = df[status_col].fillna("").astype(str).str.strip() if (status_col and status_col in df.columns) else "Unknown"
+    
+    if max_col and max_col in df.columns:
+        out["Max Quantity"] = df[max_col].fillna("").astype(str).str.strip()
+        out["Max 0"] = np.where(out["Max Quantity"] == "0", "Yes", "No")
     else:
         out["Max Quantity"] = ""
         out["Max 0"]        = "No"
 
     out = out[out["SKU"] != ""].copy()
 
-    # ── Child/Parent deduplication ────────────────────────────────────────────
-    # If same Custom SKU (barcode) maps to both a child GED code (with "-")
-    # and a parent GED code (without "-"), keep the child entry.
+    # Child/Parent deduplication
     out["_is_child"] = out["TC SKU"].str.contains("-", na=False).astype(int)
     out = out.sort_values("_is_child", ascending=False)  # child first
     out = out.drop_duplicates(subset=["SKU"], keep="first")
@@ -816,18 +1008,66 @@ def load_zecom(file, country="PH"):
 
     try:
         if name.endswith(".csv"):
-            raw_df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+            raw_df = pd.read_csv(io.BytesIO(raw), header=None, nrows=10, dtype=str)
         else:
             try:
                 import python_calamine
-                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, engine="calamine")
+                xl = pd.ExcelFile(io.BytesIO(raw), engine="calamine")
             except ImportError:
-                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+                xl = pd.ExcelFile(io.BytesIO(raw))
+            
+            sheet_names = xl.sheet_names
+            target_sheet = sheet_names[0]
+            
+            country_lower = country.lower().strip()
+            country_keywords = {
+                "my": ["my", "malaysia"],
+                "sg": ["sg", "singapore"],
+                "ph": ["ph", "phil", "philippines"]
+            }
+            keywords = country_keywords.get(country_lower, [country_lower])
+            
+            matched_sheet = None
+            for s_name in sheet_names:
+                s_name_lower = s_name.lower().strip()
+                if s_name_lower in keywords:
+                    matched_sheet = s_name
+                    break
+            
+            if not matched_sheet:
+                for s_name in sheet_names:
+                    s_name_lower = s_name.lower().strip()
+                    cleaned_s_name = re.sub(r'[^a-z0-9]', ' ', s_name_lower)
+                    for kw in keywords:
+                        if re.search(r'\b' + re.escape(kw) + r'\b', cleaned_s_name):
+                            matched_sheet = s_name
+                            break
+                    if matched_sheet:
+                        break
+            
+            if not matched_sheet:
+                for s_name in sheet_names:
+                    s_name_lower = s_name.lower().strip()
+                    if any(kw in s_name_lower for kw in keywords):
+                        matched_sheet = s_name
+                        break
+            
+            if matched_sheet:
+                target_sheet = matched_sheet
+                
+            raw_df = xl.parse(target_sheet, header=None, nrows=10, dtype=str)
     except Exception:
         return pd.DataFrame()
 
     if raw_df.empty:
         return pd.DataFrame()
+
+    # Re-apply attrs metadata
+    if not hasattr(raw_df, "attrs"):
+        raw_df.attrs = {}
+    raw_df.attrs["selected_sheet"] = target_sheet
+    raw_df.attrs["sheet_names"] = sheet_names if 'sheet_names' in locals() else [name]
+    raw_df.attrs["passed_country"] = country
 
     header_idx = None
     for r_idx in preferred_rows:
@@ -851,12 +1091,41 @@ def load_zecom(file, country="PH"):
     if header_idx is None:
         header_idx = preferred_rows[0] if preferred_rows[0] < len(raw_df) else 0
 
-    df = raw_df.iloc[header_idx + 1:].copy()
-    df.columns = [_safe_str(x) for x in raw_df.iloc[header_idx]]
+    header_row_vals = [_safe_str(x) for x in raw_df.iloc[header_idx]]
+    
+    usecols_indices = []
+    for idx, c in enumerate(header_row_vals):
+        c_lower = c.lower()
+        if (any(x in c_lower for x in ["style", "article", "pim"]) or
+            any(x in c_lower for x in ["launch"]) or
+            any(mp in c_lower for mp in ["lazada", "shopee", "zalora", "tiktok"])):
+            usecols_indices.append(idx)
+            
+    if 0 not in usecols_indices:
+        usecols_indices.append(0)
+    usecols_indices = sorted(list(set(usecols_indices)))
+    
+    try:
+        if name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw), header=None, skiprows=header_idx + 1, usecols=usecols_indices, dtype=str)
+        else:
+            df = xl.parse(target_sheet, header=None, skiprows=header_idx + 1, usecols=usecols_indices, dtype=str)
+    except Exception:
+        return pd.DataFrame()
+        
+    if df.empty:
+        return pd.DataFrame()
+        
+    col_mapping = {}
+    for idx in usecols_indices:
+        col_mapping[idx] = header_row_vals[idx]
+    df = df.rename(columns=col_mapping)
     df = df.loc[:, ~df.columns.duplicated()].copy()
     df = df.reset_index(drop=True)
-    first_col = df.columns[0]
-    # Drop rows where first column equals its own header text (duplicate header row)
+    
+    df.attrs = raw_df.attrs
+    
+    first_col = header_row_vals[0]
     df = df[df[first_col].apply(_safe_str) != first_col].copy()
     df = df.reset_index(drop=True)
 
@@ -874,35 +1143,9 @@ def load_zecom(file, country="PH"):
     if article_col and article_col != "Article No":
         df = df.rename(columns={article_col: "Article No"})
 
-    # Drop rows with blank Article No (this is the real validity check —
-    # first column like "Line Type" can be blank on valid data rows)
     if "Article No" in df.columns:
         df = df[df["Article No"].apply(_safe_str) != ""].copy()
         df = df.reset_index(drop=True)
-
-    # Rename Launch Date column
-    launch_col = None
-    for c in ["Launch Dates", "Launch Date", "LaunchDate", "Launch"]:
-        if c in df.columns:
-            launch_col = c
-            break
-    if launch_col is None:
-        for c in df.columns:
-            if "launch" in c.lower():
-                launch_col = c
-                break
-    if launch_col and launch_col != "Launch Date":
-        df = df.rename(columns={launch_col: "Launch Date"})
-
-    # Future launch flag
-    today = pd.Timestamp.today().normalize()
-    if "Launch Date" in df.columns:
-        df["Launch Date"] = pd.to_datetime(df["Launch Date"], errors="coerce")
-        df["Future Launch"] = df["Launch Date"].apply(
-            lambda d: True if pd.notna(d) and d > today else False
-        )
-    else:
-        df["Future Launch"] = False
 
     # Build standardised Ecom_ columns
     mp_keywords = {
@@ -912,20 +1155,20 @@ def load_zecom(file, country="PH"):
         "tiktok":  "Ecom_TikTok",
     }
     for col in df.columns:
-        if col in ("Article No", "Launch Date", "Future Launch"):
+        if col == "Article No" or "launch" in col.lower():
             continue
         col_l = col.lower()
         for mp_key, ecom_name in mp_keywords.items():
             if mp_key in col_l and ecom_name not in df.columns:
-                df[ecom_name] = df.apply(
-                    lambda row, c=col: _ecom_status_from_val(
-                        row[c], row["Future Launch"]
-                    ),
-                    axis=1,
-                )
+                df[ecom_name] = df[col].apply(_safe_str)
                 break
 
-    return df
+    # Keep all columns containing "launch", "Article No", and standard Ecom_ columns
+    launch_cols = [c for c in df.columns if "launch" in c.lower()]
+    ecom_cols = [c for c in df.columns if c.startswith("Ecom_")]
+    keep_cols = ["Article No"] + launch_cols + ecom_cols
+    keep_cols = [c for c in keep_cols if c in df.columns]
+    return df[keep_cols].copy()
 
 
 # ── Exclusion List ────────────────────────────────────────────────────────────
@@ -933,20 +1176,16 @@ def load_zecom(file, country="PH"):
 def _normalise_article_no(val):
     """
     Normalise Article No for matching across files.
-    Different files use different separators for the same code:
-      531103_03  /  531103-03  /  531103 03  /  53110303
-    Standardise to underscore format: keep digits/letters, replace
-    any of [' ', '-'] with '_', collapse multiple separators,
-    and strip leading/trailing whitespace. Also uppercase.
+    Strips all non-alphanumeric characters (spaces, hyphens, underscores)
+    and converts to uppercase for absolute matching tolerance.
     """
     s = _safe_str(val)
     if not s:
         return ""
     s = s.strip().upper()
-    # Replace common separators with underscore
-    s = re.sub(r'[\s\-]+', '_', s)
-    # Remove any trailing/leading underscores
-    s = s.strip('_')
+    if s.endswith(".0"):
+        s = s[:-2]
+    s = re.sub(r'[^A-Z0-9]+', '', s)
     return s
 
 
@@ -973,8 +1212,9 @@ def load_exclusion(file):
 
     # ── Try standard layout first: explicit Article No + Status columns ──────
     art_col = None
-    for c in ["Article No", "ArticleNo", "Article Number",
-              "STYLE#", "Style#", "style#", "Style #", "STYLE #"]:
+    for c in ["Article No", "ArticleNo", "Article_No", "Article", "Style", "Style_No",
+              "STYLE#", "Style#", "style#", "Style #", "STYLE #",
+              "Article Number", "ALU_No", "ALU", "Aricle No", "Color No", "Color_No"]:
         if c in df.columns:
             art_col = c
             break
@@ -1056,16 +1296,62 @@ def load_exclusion(file):
 def load_all_file(file, country):
     if file is None:
         return pd.DataFrame()
-    df = _read_file(file)
-    if df.empty:
-        return pd.DataFrame()
-    df = _normalise_cols(df)
+        
+    file.seek(0)
+    if file.name.lower().endswith(".csv"):
+        header_df = pd.read_csv(file, nrows=1)
+    else:
+        try:
+            import python_calamine
+            header_df = pd.read_excel(file, nrows=1, engine="calamine")
+        except ImportError:
+            header_df = pd.read_excel(file, nrows=1)
+    file.seek(0)
+    
+    actual_cols = list(header_df.columns)
+    
+    # 1. SKU column
+    sku_col = None
+    for c in ["sellerSKU", "SellerSKU", "SKU", "Seller SKU"]:
+        if c in actual_cols:
+            sku_col = c
+            break
+            
+    # 2. Stock and Reserved Columns
     stock_col_map = {
         "SG": ("MyStock-YCH-SG quantity",  "MyStock-YCH-SG reservedQuantity"),
         "MY": ("MyStock-YCH-MY quantity",  "MyStock-YCH-MY reservedQuantity"),
         "PH": ("MyStock-PH quantity",      "MyStock-PH reservedQuantity"),
     }
-    stock_col, reserved_col = stock_col_map.get(country, ("", ""))
+    target_stock, target_reserved = stock_col_map.get(country, ("", ""))
+    
+    stock_col = None
+    if target_stock in actual_cols:
+        stock_col = target_stock
+    else:
+        for c in actual_cols:
+            if "quantity" in c.lower() and country.lower() in c.lower():
+                stock_col = c
+                break
+                
+    reserved_col = None
+    if target_reserved in actual_cols:
+        reserved_col = target_reserved
+    else:
+        for c in actual_cols:
+            if "reserved" in c.lower():
+                reserved_col = c
+                break
+                
+    usecols = []
+    if sku_col: usecols.append(sku_col)
+    if stock_col: usecols.append(stock_col)
+    if reserved_col: usecols.append(reserved_col)
+    
+    df = _read_file(file, usecols=usecols if usecols else None)
+    if df.empty:
+        return pd.DataFrame()
+    df = _normalise_cols(df)
     for c in ["sellerSKU", "SellerSKU", "SKU", "Seller SKU"]:
         if c in df.columns:
             df = df.rename(columns={c: "SKU"})
@@ -1086,15 +1372,21 @@ def load_all_file(file, country):
                 break
     if "SKU" not in df.columns:
         return pd.DataFrame()
-    df["SKU"] = df["SKU"].apply(_clean_sku)
+    import numpy as np
+    s_sku = df["SKU"].fillna("").astype(str).str.strip()
+    float_mask = s_sku.str.match(r'^\d+\.0$', na=False)
+    df["SKU"] = np.where(float_mask, s_sku.str[:-2], s_sku)
     for num_col in ["TC Stock", "Reserved Stock"]:
         if num_col in df.columns:
             df[num_col] = pd.to_numeric(
-                df[num_col].apply(_safe_str), errors="coerce"
+                df[num_col].fillna("").astype(str).str.strip(), errors="coerce"
             ).fillna(0)
         else:
             df[num_col] = 0.0
-    return df[df["SKU"] != ""].copy()
+    df = df[df["SKU"] != ""].copy()
+    # Slice only needed columns to keep memory low
+    keep_cols = [c for c in ["SKU", "TC Stock", "Reserved Stock"] if c in df.columns]
+    return df[keep_cols].copy()
 
 
 # ── Master loader ─────────────────────────────────────────────────────────────
@@ -1180,4 +1472,3 @@ def load_all_files(
     data["all_file"]  = load_all_file(all_file, country)
     data["exclusion"] = load_exclusion(exclusion_file)
     return data
-
