@@ -31,13 +31,18 @@ def _normalise_status(status):
 
 
 def _normalise_article_no(val):
-    """Standardise Article No separators/case for cross-file matching."""
+    """
+    Normalise Article No for matching across files.
+    Strips all non-alphanumeric characters (spaces, hyphens, underscores)
+    and converts to uppercase for absolute matching tolerance.
+    """
     s = _safe_str(val)
     if not s:
         return ""
     s = s.strip().upper()
-    s = re.sub(r'[\s\-]+', '_', s)
-    s = s.strip('_')
+    if s.endswith(".0"):
+        s = s[:-2]
+    s = re.sub(r'[^A-Z0-9]+', '', s)
     return s
 
 
@@ -55,7 +60,10 @@ def _build_article_map(content):
         for _, r in content.iterrows():
             sku = _safe_str(r.get("SKU", ""))
             if sku:
-                article_map[sku] = _normalise_article_no(r.get(art_col, ""))
+                s_art = _safe_str(r.get(art_col, "")).strip()
+                if s_art.endswith(".0"):
+                    s_art = s_art[:-2]
+                article_map[sku] = s_art
     return article_map
 
 
@@ -132,12 +140,72 @@ def _build_excl_map(exclusion):
     excl_map = {}
     if exclusion is None or exclusion.empty:
         return excl_map
-    if "Article No" not in exclusion.columns:
+
+    # Candidates for the Article/ALU/Color No column
+    art_candidates = [
+        "Article No", "ALU_No", "ALU", "Aricle No", "Article Number", "Color No", "Color_No"
+    ]
+    
+    art_col = None
+    for c in art_candidates:
+        if c in exclusion.columns:
+            art_col = c
+            break
+            
+    if not art_col:
+        # Fallback to case-insensitive and loose match
+        for col in exclusion.columns:
+            col_lower = col.lower().replace(" ", "").replace("_", "").replace("-", "")
+            if col_lower in ["articleno", "aluno", "alu", "aricleno", "articlenumber", "colorno", "color_no"]:
+                art_col = col
+                break
+                
+    if not art_col:
+        # Final fallback: look for any column containing "article", "style", "alu", or "color"
+        for col in exclusion.columns:
+            col_l = col.lower()
+            if "article" in col_l or "style" in col_l or "alu" in col_l or "color" in col_l:
+                art_col = col
+                break
+
+    if not art_col:
         return excl_map
-    for _, r in exclusion.iterrows():
-        art = _normalise_article_no(r.get("Article No", ""))
+
+    # Candidates for the Status column
+    status_col = None
+    for col in exclusion.columns:
+        if col == "Exclusion Status":
+            status_col = col
+            break
+    if not status_col:
+        for col in exclusion.columns:
+            col_l = col.lower()
+            if "exclusion status" in col_l:
+                status_col = col
+                break
+    if not status_col:
+        for col in exclusion.columns:
+            col_l = col.lower()
+            if "status" in col_l:
+                status_col = col
+                break
+
+    art_nos = exclusion[art_col].tolist()
+    if status_col:
+        statuses = exclusion[status_col].tolist()
+    else:
+        statuses = ["Inactive"] * len(art_nos)
+
+    for raw_val, status in zip(art_nos, statuses):
+        status_s = _safe_str(status)
+        art = _normalise_article_no(raw_val)
         if art:
-            excl_map[art] = _safe_str(r.get("Exclusion Status", "Inactive"))
+            excl_map[art] = status_s
+
+        raw_clean = re.sub(r'\D', '', _safe_str(raw_val))
+        if re.fullmatch(r'\d{13}', raw_clean):
+            excl_map[raw_clean] = status_s
+
     return excl_map
 
 
@@ -163,7 +231,7 @@ def _build_launch_map(zecom):
 
 
 def _needs_buffer(mp_name):
-    return mp_name in ("Lazada PH", "TikTok MY")
+    return mp_name in ("Lazada PH", "TikTok MY", "Zalora PH")
 
 
 def generate_status_report(data, country):
@@ -207,11 +275,12 @@ def generate_status_report(data, country):
             mp_status  = _safe_str(row.get("MP Status", "Unknown"))
             mp_stock   = _safe_num(row.get("MP Stock", 0))
             article_no = article_map.get(sku, "")
-            ecom_st    = ecom_map.get(article_no, "Inactive") if article_no else "Inactive"
-            launch_dt  = launch_map.get(article_no, "") if article_no else ""
+            art_norm   = _normalise_article_no(article_no)
+            ecom_st    = ecom_map.get(art_norm, "Inactive") if art_norm else "Inactive"
+            launch_dt  = launch_map.get(art_norm, "") if art_norm else ""
             tc_data    = tc_map.get(sku, {"TC SKU": "", "TC Status": "Unknown", "Max 0": "No"})
             sd         = stock_map.get(sku, {"TC Stock": 0.0, "Reserved Stock": 0.0})
-            excl_lbl   = excl_map.get(article_no, "") if article_no else ""
+            excl_lbl   = excl_map.get(art_norm, "") if art_norm else ""
 
             frames.append({
                 "Marketplace":    mp_name,
@@ -231,4 +300,3 @@ def generate_status_report(data, country):
             })
 
     return pd.DataFrame(frames) if frames else pd.DataFrame()
-
