@@ -1,1064 +1,1150 @@
-import re
-import pandas as pd
-import numpy as np
+/*************************************************************************************
+ * PUMA LISTING GENERATION SCRIPT — CORRECTED VERSION
+ * -----------------------------------------------------------------------------------
+ * Structure (per requirement #6):
+ *   SECTION A: INPUT PROCESSING
+ *     - populateSizeData()
+ *     - populateColorDataFromColorExport()
+ *     - populateStyleDataFromStyleExport()
+ *     - validateInputSheet()               [NEW]
+ *     - resolveTitleAndDescription()       [NEW - req #1]
+ *     - resolveSizeAndSkipFlags()          [NEW - req #2 & #3]
+ *     - resolveImageURL()                  [NEW - req #4]
+ *
+ *   SECTION B: OUTPUT GENERATION
+ *     - runInputProcessing()   -> entry point for Section A
+ *     - runOutputGeneration()  -> entry point for Section B (old myFunction logic)
+ *     - main()                 -> orchestrates both, in order
+ *
+ * Each requirement below is tagged with a comment block referencing the request item.
+ *************************************************************************************/
 
+/* =====================================================================================
+ * ENTRY POINT
+ * ===================================================================================== */
+function main() {
+  runInputProcessing();
+  runOutputGeneration();
+}
 
-def _safe_num(val):
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return 0.0
+/* =====================================================================================
+ * SECTION A: INPUT PROCESSING
+ * =====================================================================================
+ * Everything that prepares/cleans the "Input" sheet lives here. Output generation
+ * (Section B) should never need to re-derive raw export data — it only reads the
+ * already-resolved columns this section writes.
+ * ===================================================================================== */
 
+function runInputProcessing() {
+  populateSizeData();
+  populateColorDataFromColorExport();
+  populateStyleDataFromStyleExport();
+  validateInputSheet();                 // NEW: basic sanity checks before proceeding
+  resolveTitleAndDescriptionForSheet();  // NEW: requirement #1
+  resolveSizeAndSkipFlagsForSheet();     // NEW: requirement #2 / #3
+  resolveImageURLsForSheet();            // NEW: requirement #4 (moved off Output, now Input-side)
+}
 
-def _safe_str(val):
-    if val is None:
-        return ""
-    try:
-        if pd.isna(val):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    return str(val).strip()
+/* -------------------------------------------------------------------------------------
+ * REQUIREMENT #1 — Title & Description fallback: English -> English (UK)
+ * -------------------------------------------------------------------------------------
+ * Assumes the "Style Export" sheet contains BOTH:
+ *   "Regional Display Name (English)"      / "Regional Display Name (English (UK))"
+ *   "Long Description (English)"           / "Long Description (English (UK))"
+ *   "Short Description (English)"          / "Short Description (English (UK))"
+ * If your export uses different header text, update the STYLE_COL_PAIRS map below.
+ * ------------------------------------------------------------------------------------- */
 
+// Columns in the "Input" sheet that hold the RESOLVED (fallback-applied) values.
+// (Re-uses the same input columns the rest of the script already expects:
+//  2 = Regional Display Name, 24 = Short Description, 25 = Long Description)
+const RESOLVED_TITLE_COL = 2;
+const RESOLVED_SHORT_DESC_COL = 24;
+const RESOLVED_LONG_DESC_COL = 25;
 
-def _clean_sku(val):
-    s = _safe_str(val)
-    if re.fullmatch(r'\d+\.0', s):
-        s = s[:-2]
-    return s
+// Pairs of (English column header, English UK column header) to pull from "Style Export".
+const STYLE_COL_PAIRS = [
+  { primary: "Regional Display Name (English)", fallback: "Regional Display Name (English (UK))", inputCol: RESOLVED_TITLE_COL },
+  { primary: "Short Description (English)",      fallback: "Short Description (English (UK))",      inputCol: RESOLVED_SHORT_DESC_COL },
+  { primary: "Long Description (English)",       fallback: "Long Description (English (UK))",        inputCol: RESOLVED_LONG_DESC_COL }
+];
 
+function resolveTitleAndDescriptionForSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const inputSheet = ss.getSheetByName("Input");
+  const styleSheet = ss.getSheetByName("Style Export");
+  if (!inputSheet || !styleSheet) {
+    throw new Error("Input sheet or Style Export sheet not found (resolveTitleAndDescriptionForSheet)");
+  }
 
+  const norm = v => (v ? v.toString().trim().toLowerCase() : "");
+  const findIndex = (header, name) => header.findIndex(h => norm(h) === norm(name));
 
-def _normalise_status(status):
-    s = _safe_str(status).lower()
-    if s in ("active", "1", "enabled", "yes", "y", "live", "listed"):
-        return "Active"
-    if s in ("inactive", "0", "disabled", "no", "n", "delisted",
-             "unlisted", "deleted", "removed"):
-        return "Inactive"
-    return _safe_str(status)
+  const inputData = inputSheet.getDataRange().getValues();
+  const inputHeader = inputData[0];
+  const styleNoIdx = findIndex(inputHeader, "Style no.");
+  if (styleNoIdx === -1) throw new Error("Style no. column not found in Input sheet");
 
+  const styleData = styleSheet.getDataRange().getValues();
+  const styleHeader = styleData.shift();
+  const styleExportStyleNoIdx = findIndex(styleHeader, "Style no.");
+  if (styleExportStyleNoIdx === -1) throw new Error("Style no. column not found in Style Export sheet");
 
-def _standardise_raw_ecom_series(ser):
-    s = ser.fillna("").astype(str).str.strip().str.upper()
-    yes_mask = s.isin(["YES", "Y", "ACTIVE"])
-    no_mask = s.isin(["NO", "N", "INACTIVE"])
-    off_mask = s == "OFF"
-    na_mask = s.isin(["#N/A", ""])
-    default_vals = ser.fillna("").astype(str).str.strip()
-    return np.select(
-        [yes_mask, no_mask, off_mask, na_mask],
-        ["Yes", "No", "OFF", "#N/A"],
-        default=default_vals
-    )
+  // Resolve column indices for each primary/fallback pair. Missing fallback columns
+  // are tolerated (fallback logic simply won't trigger for that field).
+  STYLE_COL_PAIRS.forEach(pair => {
+    pair.primaryIdx = findIndex(styleHeader, pair.primary);
+    pair.fallbackIdx = findIndex(styleHeader, pair.fallback);
+  });
 
+  const styleMap = {};
+  styleData.forEach(row => {
+    const key = norm(row[styleExportStyleNoIdx]);
+    if (key) styleMap[key] = row;
+  });
 
-def _is_valid_sku(sku):
-    """Seller SKU must be exactly 13 digits."""
-    return bool(re.fullmatch(r'\d{13}', _safe_str(sku)))
+  for (let r = 1; r < inputData.length; r++) {
+    const rawStyleNo = inputData[r][styleNoIdx];
+    if (!rawStyleNo) continue;
+    const lookupKey = norm(rawStyleNo.toString());
+    const styleRow = styleMap[lookupKey];
+    if (!styleRow) continue;
 
+    STYLE_COL_PAIRS.forEach(pair => {
+      let value = pair.primaryIdx !== -1 ? styleRow[pair.primaryIdx] : "";
+      if ((value === "" || value === undefined || value === null) && pair.fallbackIdx !== -1) {
+        value = styleRow[pair.fallbackIdx]; // fallback to English (UK)
+      }
+      inputData[r][pair.inputCol - 1] = value || "";
+    });
+  }
 
-def _normalise_article_no(val):
-    """
-    Normalise Article No for cross-file matching.
-    Strips all non-alphanumeric characters (spaces, hyphens, underscores)
-    and converts to uppercase for absolute matching tolerance.
-    """
-    s = _safe_str(val)
-    if not s:
-        return ""
-    s = s.strip().upper()
-    if s.endswith(".0"):
-        s = s[:-2]
-    s = re.sub(r'[^A-Z0-9]+', '', s)
-    return s
+  inputSheet.getRange(1, 1, inputData.length, inputData[0].length).setValues(inputData);
+  SpreadsheetApp.flush();
+}
 
+/* -------------------------------------------------------------------------------------
+ * REQUIREMENT #2 & #3 — Size handling: dual-size skip, JPN fallback, no size-format crashes
+ * -------------------------------------------------------------------------------------
+ * Adds a "JPN Size" column to Input, and a "Skip Row" flag column used by output
+ * generation to silently exclude rows instead of throwing errors.
+ *
+ * Rules implemented:
+ *  - A SKU is "dual-size" if its resolved size string contains a slash format that is
+ *    NOT one of the recognized combined sizes (S/M, M/L, L/XL) — e.g. "38/39" style
+ *    dual-shoe sizing. Those rows are flagged to be skipped.
+ *  - JPN size column is populated from the Size Export sheet if present.
+ *  - For a given article (Style no.), if UK size is blank across all its child rows,
+ *    JPN size is used as the fallback size instead, so the article isn't skipped
+ *    entirely for lacking UK data.
+ * ------------------------------------------------------------------------------------- */
 
-# ── Lookup builders ───────────────────────────────────────────────────────────
+const JPN_SIZE_COL = 37;      // New column in Input sheet dedicated to JPN size
+const SKIP_ROW_COL = 38;      // New column: "1" = skip this row during output generation
+const RESOLVED_SIZE_SOURCE_COL = 39; // New column: which source was used ("UK"/"JPN"/etc.) for traceability
 
-def _build_article_map(content):
-    """SKU -> Article No (preserves original format). Tries multiple candidate columns."""
-    article_map = {}
-    if content.empty or "SKU" not in content.columns:
-        return article_map
-    art_col = next(
-        (c for c in ["Article No", "ArticleNo", "Article Number",
-                      "Color_No", "Color_No.1", "Style#", "STYLE#",
-                      "Style #", "STYLE #"]
-         if c in content.columns),
-        next((c for c in content.columns
-              if "article" in c.lower() or "color" in c.lower()
-              or "style" in c.lower()), "")
-    )
-    if art_col:
-        skus = content["SKU"].tolist()
-        art_vals = content[art_col].tolist()
-        for sku, art in zip(skus, art_vals):
-            sku_s = _safe_str(sku)
-            if sku_s:
-                s_art = _safe_str(art).strip()
-                if s_art.endswith(".0"):
-                    s_art = s_art[:-2]
-                article_map[sku_s] = s_art
-    return article_map
+function resolveSizeAndSkipFlagsForSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const inputSheet = ss.getSheetByName("Input");
+  const sizeSheet = ss.getSheetByName("Size Export");
+  if (!inputSheet) throw new Error("Input sheet not found (resolveSizeAndSkipFlagsForSheet)");
 
+  const lastRow = inputSheet.getLastRow();
+  if (lastRow < 2) return;
 
-def _build_ecom_map(zecom, mp_name):
-    """Article No -> Ecom Status for the given marketplace."""
-    ecom_map = {}
-    if zecom.empty or "Article No" not in zecom.columns:
-        return ecom_map
-    mp_key = mp_name.split()[0].lower()
-    ecom_col = next(
-        (c for c in zecom.columns
-         if c.startswith("Ecom_") and mp_key in c.lower()), ""
-    )
-    if not ecom_col:
-        return ecom_map
-    arts = zecom["Article No"].tolist()
-    ecom_vals = zecom[ecom_col].tolist()
-    for art, val in zip(arts, ecom_vals):
-        art_norm = _normalise_article_no(art)
-        if art_norm:
-            ecom_map[art_norm] = _safe_str(val)
-    return ecom_map
+  // Pull JPN size from Size Export (if the column exists) and write into Input.
+  if (sizeSheet) {
+    const norm = v => (v ? v.toString().trim().toLowerCase() : "");
+    const sizeData = sizeSheet.getDataRange().getValues();
+    const header = sizeData.shift();
+    const eanIdx = header.findIndex(h => norm(h) === "ean");
+    const colorNoIdx = header.findIndex(h => norm(h) === "color no");
+    const jpnIdx = header.findIndex(h => norm(h) === "print size code (jpn)");
 
+    if (eanIdx !== -1 && jpnIdx !== -1) {
+      // Map EAN -> JPN size for direct lookup against Input rows (Input col 16 = EAN/customSku source).
+      const eanToJpn = {};
+      sizeData.forEach(row => {
+        const ean = row[eanIdx];
+        if (ean) eanToJpn[norm(ean)] = row[jpnIdx] || "";
+      });
 
-def _build_tc_map(tc_inv):
-    if tc_inv.empty or "SKU" not in tc_inv.columns:
-        return {}
-
-    skus = tc_inv["SKU"].tolist()
-    tc_skus = tc_inv["TC SKU"].tolist() if "TC SKU" in tc_inv.columns else skus
-    tc_statuses = tc_inv["TC Status"].tolist() if "TC Status" in tc_inv.columns else ["Unknown"] * len(skus)
-    max_0s = tc_inv["Max 0"].tolist() if "Max 0" in tc_inv.columns else ["No"] * len(skus)
-
-    tc_map = {}
-    parent_fallback = {}
-
-    for sku, tc_sku_raw, tc_status, max_0 in zip(skus, tc_skus, tc_statuses, max_0s):
-        if not sku:
-            continue
-        entry = {
-            "TC SKU":    tc_sku_raw,
-            "TC Status": tc_status,
-            "Max 0":     max_0,
-        }
-        if "-" in sku:
-            tc_map[sku] = entry
-            parent_base = sku.rsplit("-", 1)[0]
-            if parent_base not in tc_map:
-                parent_fallback[parent_base] = entry
-        else:
-            if sku not in tc_map:
-                tc_map[sku] = entry
-
-    for parent, entry in parent_fallback.items():
-        if parent not in tc_map:
-            tc_map[parent] = entry
-
-    return tc_map
-
-
-def _build_stock_map(all_df, apply_buffer=False):
-    if all_df.empty or "SKU" not in all_df.columns:
-        return {}
-
-    # Drop duplicate SKUs keeping the first, since the loop only adds when SKU is not in stock_map
-    df_unique = all_df.drop_duplicates(subset=["SKU"], keep="first")
-    
-    # We already converted TC Stock and Reserved Stock during load_all_file, but let's make sure
-    tc_stock = pd.to_numeric(df_unique["TC Stock"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    if apply_buffer:
-        tc_stock = (tc_stock - 1.0).clip(lower=0.0)
-        
-    reserved_stock = pd.to_numeric(df_unique["Reserved Stock"], errors="coerce").fillna(0.0)
-    
-    skus = df_unique["SKU"].tolist()
-    tc_stock_list = tc_stock.tolist()
-    res_stock_list = reserved_stock.tolist()
-    
-    stock_map = {
-        sku: {"TC Stock": tc, "Reserved Stock": res}
-        for sku, tc, res in zip(skus, tc_stock_list, res_stock_list)
+      const eanColInInput = inputSheet.getRange(2, 16, lastRow - 1, 1).getValues(); // col P (EAN)
+      const jpnOut = eanColInInput.map(r => [eanToJpn[norm(r[0])] || ""]);
+      inputSheet.getRange(2, JPN_SIZE_COL, jpnOut.length, 1).setValues(jpnOut);
+    } else {
+      // No JPN column available upstream — leave blank, not an error.
+      inputSheet.getRange(2, JPN_SIZE_COL, lastRow - 1, 1).setValue("");
     }
-    return stock_map
+  }
+  inputSheet.getRange(1, JPN_SIZE_COL).setValue("JPN Size");
+  inputSheet.getRange(1, SKIP_ROW_COL).setValue("Skip Row");
+  inputSheet.getRange(1, RESOLVED_SIZE_SOURCE_COL).setValue("Size Source Used");
 
+  // --- Determine per-article whether UK size is present at all ---
+  const data = inputSheet.getRange(2, 1, lastRow - 1, Math.max(JPN_SIZE_COL, 22)).getValues();
+  // Column indices (0-based) relative to the range above: col V (22) = UK size (per populateSizeData mapping).
+  const UK_SIZE_IDX = 21 - 1; // sheet col 21 -> index 20 within a 1-based getRange starting at col 1... see note below.
 
-def _build_excl_map(exclusion):
-    excl_map = {}
-    if exclusion is None or exclusion.empty:
-        return excl_map
+  // NOTE: populateSizeData() writes UK size into column V (22) as outRow[21] (0-indexed) -> sheet column 22.
+  // Re-derive correctly against a full-width read to avoid off-by-one mistakes:
+  const fullData = inputSheet.getRange(2, 1, lastRow - 1, RESOLVED_SIZE_SOURCE_COL).getValues();
+  const styleNoColIdx = 0;      // Column A
+  const ukSizeColIdx = 21;      // Column V (1-indexed 22 -> 0-indexed 21)
+  const jpnSizeColIdx = JPN_SIZE_COL - 1;
 
-    # Candidates for the Article/ALU/Color No column
-    art_candidates = [
-        "Article No", "ALU_No", "ALU", "Aricle No", "Article Number", "Color No", "Color_No"
-    ]
-    
-    art_col = None
-    for c in art_candidates:
-        if c in exclusion.columns:
-            art_col = c
-            break
-            
-    if not art_col:
-        # Fallback to case-insensitive and loose match
-        for col in exclusion.columns:
-            col_lower = col.lower().replace(" ", "").replace("_", "").replace("-", "")
-            if col_lower in ["articleno", "aluno", "alu", "aricleno", "articlenumber", "colorno", "color_no"]:
-                art_col = col
-                break
-                
-    if not art_col:
-        # Final fallback: look for any column containing "article", "style", "alu", or "color"
-        for col in exclusion.columns:
-            col_l = col.lower()
-            if "article" in col_l or "style" in col_l or "alu" in col_l or "color" in col_l:
-                art_col = col
-                break
+  const styleHasUK = {};
+  fullData.forEach(row => {
+    const style = row[styleNoColIdx];
+    const uk = row[ukSizeColIdx];
+    if (!style) return;
+    if (!styleHasUK[style]) styleHasUK[style] = false;
+    if (uk !== "" && uk !== undefined && uk !== null) styleHasUK[style] = true;
+  });
 
-    if not art_col:
-        return excl_map
+  // --- Recognized combined sizes that are NOT considered "dual size" duplicates ---
+  const RECOGNIZED_COMBINED_SIZES = ["S/M", "M/L", "L/XL"];
 
-    # Candidates for the Status column
-    status_col = None
-    for col in exclusion.columns:
-        if col == "Exclusion Status":
-            status_col = col
-            break
-    if not status_col:
-        for col in exclusion.columns:
-            col_l = col.lower()
-            if "exclusion status" in col_l:
-                status_col = col
-                break
-    if not status_col:
-        for col in exclusion.columns:
-            col_l = col.lower()
-            if "status" in col_l:
-                status_col = col
-                break
+  const skipFlags = [];
+  const sizeSourceUsed = [];
 
-    art_nos = exclusion[art_col].tolist()
-    if status_col:
-        statuses = exclusion[status_col].tolist()
-    else:
-        statuses = ["Inactive"] * len(art_nos)
+  fullData.forEach(row => {
+    const style = row[styleNoColIdx];
+    const uk = row[ukSizeColIdx];
+    const jpn = row[jpnSizeColIdx];
 
-    for raw_val, status in zip(art_nos, statuses):
-        status_s = _safe_str(status)
-        art = _normalise_article_no(raw_val)
-        if art:
-            excl_map[art] = status_s
+    let skip = "";
+    let sourceUsed = "";
 
-        raw_clean = re.sub(r'\D', '', _safe_str(raw_val))
-        if re.fullmatch(r'\d{13}', raw_clean):
-            excl_map[raw_clean] = status_s
+    const ukPresentForArticle = styleHasUK[style] === true;
 
-    return excl_map
+    if (uk !== "" && uk !== undefined && uk !== null) {
+      // UK size present on this row — check for dual-size pattern.
+      const ukStr = uk.toString();
+      const isRecognizedCombo = RECOGNIZED_COMBINED_SIZES.some(c => ukStr.indexOf(c) !== -1);
+      const looksLikeDualSize = ukStr.indexOf("/") !== -1 && !isRecognizedCombo;
 
-
-def _build_launch_map(zecom, mp_name):
-    if zecom.empty or "Article No" not in zecom.columns:
-        return {}
-        
-    mp_lower = mp_name.lower()
-    candidates = []
-    if "lazada" in mp_lower or "shopee" in mp_lower:
-        candidates = ["LAZ & SHP Launch Date", "Lazada & Shopee Launch Dates"]
-    elif "zalora" in mp_lower:
-        candidates = ["Tiktok & Zalora Launch Dates", "ZAL Launch Date", "ZAL & TK Launch Date", "ZAL & TK\nLaunch Date"]
-    elif "tiktok" in mp_lower:
-        candidates = ["Tiktok & Zalora Launch Dates", "ZAL & TK Launch Date", "ZAL & TK\nLaunch Date", "TKTK Launch Date"]
-        
-    col_name = None
-    for c in candidates:
-        if c in zecom.columns:
-            col_name = c
-            break
-            
-    if not col_name:
-        for c in ["Launch Date", "LaunchDate", "Launch_Date"]:
-            if c in zecom.columns:
-                col_name = c
-                break
-                
-    if not col_name:
-        for c in zecom.columns:
-            c_norm = c.lower().replace(" ", "").replace("_", "").replace("-", "")
-            if "launchdate" in c_norm:
-                col_name = c
-                break
-                
-    if not col_name:
-        return {}
-
-    arts = zecom["Article No"].tolist()
-    formatted_dates = pd.to_datetime(zecom[col_name], errors="coerce").dt.strftime("%Y-%m-%d").fillna("").tolist()
-
-    launch_map = {}
-    for art, formatted_ld in zip(arts, formatted_dates):
-        art_norm = _normalise_article_no(art)
-        if art_norm:
-            launch_map[art_norm] = formatted_ld
-    return launch_map
-
-
-def _build_future_launch_map(zecom, mp_name):
-    if zecom.empty or "Article No" not in zecom.columns:
-        return {}
-        
-    launch_map = _build_launch_map(zecom, mp_name)
-    if not launch_map:
-        return {}
-        
-    today = pd.Timestamp.today().normalize()
-    fl_map = {}
-    for art, ld in launch_map.items():
-        if ld:
-            try:
-                d = pd.to_datetime(ld)
-                fl_map[art] = bool(pd.notna(d) and d > today)
-            except Exception:
-                fl_map[art] = False
-        else:
-            fl_map[art] = False
-    return fl_map
-
-
-def _needs_buffer(mp_name):
-    """Buffer -1 stock only for Lazada PH, TikTok MY, and Zalora PH."""
-    return mp_name in ("Lazada PH", "TikTok MY", "Zalora PH")
-
-
-# ── Exclusion override ────────────────────────────────────────────────────────
-
-def _apply_exclusion(article_no, tc_stock, excl_map, max_0, sku=None):
-    """
-    Check exclusion by Article No first, then by raw SKU (13-digit)
-    as a fallback — so exclusion works even without a Content File
-    bridging SKU -> Article No.
-    """
-    match_key = None
-    if article_no and article_no in excl_map:
-        match_key = article_no
-    elif sku and sku in excl_map:
-        match_key = sku
-
-    if match_key is None:
-        return None
-    excl_status = excl_map[match_key]
-    if excl_status == "Inactive":
-        # If Max 0 is already Yes, no need to set max 0 again
-        max_action = "" if max_0 == "Yes" else "Set max 0"
-        return ("Inactive", "Inactive as per AM Request", max_action)
-    if excl_status == "Active":
-        if tc_stock >= 1:
-            ma = "Remove max" if max_0 == "Yes" else ""
-            return ("Active", "Active as per AM Request", ma)
-        else:
-            ma = "Remove max" if max_0 == "Yes" else ""
-            return ("Inactive", "AM Request Active but 0 Stock", ma)
-    return None
-
-
-# ── SKU-level logic ───────────────────────────────────────────────────────────
-
-def _sku_logic(mp_status, mp_stock, ecom_status, tc_status,
-               tc_stock, reserved, max_0, article_no, excl_map, sku=None):
-    """
-    ecom_status here is the normalised value (Inactive for future launch too).
-    """
-    excl = _apply_exclusion(article_no, tc_stock, excl_map, max_0, sku=sku)
-    if excl:
-        final_status, comment, max_action = excl
-    else:
-        if ecom_status == "Inactive":
-            final_status = "Inactive"
-            comment      = "Due to Ecom No"
-        elif tc_stock == 0:
-            final_status = "Inactive"
-            comment      = "Due to 0 Stock"
-        else:
-            final_status = "Active"
-            comment      = "Ecom Yes with Stock"
-
-        max_action = ""
-        if comment == "Due to Ecom No" and max_0 == "No":
-            max_action = "Set max 0"
-        elif comment in ("Due to 0 Stock", "Ecom Yes with Stock") and max_0 == "Yes":
-            max_action = "Remove max"
-
-    mp_norm  = _normalise_status(mp_status)
-    tc_norm  = _normalise_status(tc_status)
-    fin_norm = final_status
-
-    final_check = (mp_norm == tc_norm == fin_norm)
-    stock_check = (mp_stock == tc_stock)
-
-    if not final_check:
-        remarks = "Change to Active" if final_status == "Active" else "Change to Inactive"
-    elif not stock_check:
-        if final_status == "Active":
-            remarks = "Due to Reserved Stock" if reserved != 0 else "Make Impact"
-        else:
-            remarks = "Stock not pushed due to Inactive Status"
-    else:
-        remarks = "All Good"
-
-    push_0 = "Yes" if (tc_stock <= 0 and mp_stock > 0) else ""
-
-    return {
-        "Final Status":  final_status,
-        "Comments":      comment,
-        "Final Check":   str(final_check),
-        "Stock Check":   str(stock_check),
-        "Remarks":       remarks,
-        "Max Setup":     max_action,
-        "Update 0":      push_0,
+      if (looksLikeDualSize) {
+        skip = "1"; // Requirement: identify & skip dual-size SKUs
+        sourceUsed = "SKIPPED-DUAL";
+      } else {
+        sourceUsed = "UK";
+      }
+    } else if (!ukPresentForArticle && jpn !== "" && jpn !== undefined && jpn !== null) {
+      // No UK size anywhere for this article -> fall back to JPN size.
+      sourceUsed = "JPN-FALLBACK";
+    } else if (ukPresentForArticle && (uk === "" || uk === undefined || uk === null)) {
+      // UK exists for the article generally but not this particular row — and JPN
+      // rows are skipped by default per requirement #2, since UK data does exist elsewhere.
+      skip = "1";
+      sourceUsed = "SKIPPED-JPN-DEFAULT";
+    } else {
+      // No UK size for the article and no JPN size either — nothing usable.
+      skip = "1";
+      sourceUsed = "SKIPPED-NO-SIZE-DATA";
     }
 
+    skipFlags.push([skip]);
+    sizeSourceUsed.push([sourceUsed]);
+  });
 
-# ── Vectorized status helper ───────────────────────────────────────────
+  inputSheet.getRange(2, SKIP_ROW_COL, skipFlags.length, 1).setValues(skipFlags);
+  inputSheet.getRange(2, RESOLVED_SIZE_SOURCE_COL, sizeSourceUsed.length, 1).setValues(sizeSourceUsed);
 
-def _normalise_status_series(ser):
-    s = ser.fillna("").astype(str).str.strip().str.lower()
-    active_mask = s.isin(["active", "1", "enabled", "yes", "y", "live", "listed"])
-    inactive_mask = s.isin(["inactive", "0", "disabled", "no", "n", "delisted", "unlisted", "deleted", "removed"])
-    default_vals = ser.fillna("").astype(str).str.strip()
-    return np.select([active_mask, inactive_mask], ["Active", "Inactive"], default=default_vals)
+  SpreadsheetApp.flush();
+}
 
+/* -------------------------------------------------------------------------------------
+ * Helper used by output generation to get the "effective" size string for a row,
+ * honoring the JPN fallback resolved above. Replaces raw variation2() calls where size
+ * text is actually needed downstream (sorting, mapping keys, display).
+ * ------------------------------------------------------------------------------------- */
+function getEffectiveSize(inputSheet, rowIndex) {
+  const uk = inputSheet.getRange(rowIndex, 22).getValue();   // Column V
+  const jpn = inputSheet.getRange(rowIndex, JPN_SIZE_COL).getValue();
+  const sourceUsed = inputSheet.getRange(rowIndex, RESOLVED_SIZE_SOURCE_COL).getValue();
 
-# ── SKU-level validation (Lazada + Zalora) ────────────────────────────────────
+  if (sourceUsed === "JPN-FALLBACK") return jpn;
+  return uk; // default: UK size (already validated as non-dual by resolveSizeAndSkipFlagsForSheet)
+}
 
-def run_sku_validation(data, country):
-    content   = data.get("content",   pd.DataFrame())
-    tc_inv    = data.get("tc_inv",    pd.DataFrame())
-    zecom     = data.get("zecom",     pd.DataFrame())
-    all_df    = data.get("all_file",  pd.DataFrame())
-    exclusion = data.get("exclusion", pd.DataFrame())
+function isRowSkipped(inputSheet, rowIndex) {
+  return inputSheet.getRange(rowIndex, SKIP_ROW_COL).getValue() === "1";
+}
 
-    excl_map    = _build_excl_map(exclusion)
-    article_map = _build_article_map(content)
-    tc_map      = _build_tc_map(tc_inv)
+/* -------------------------------------------------------------------------------------
+ * REQUIREMENT #4 — Tiered image fetching: Global -> SEA -> PHL -> IND
+ * -------------------------------------------------------------------------------------
+ * Replaces generatePumaImageURLs(). Skips "Coming Soon" placeholder images and moves
+ * to the next region tier. Writes resolved image URLs directly into Input so output
+ * generation doesn't need network calls at all.
+ * ------------------------------------------------------------------------------------- */
 
-    mp_sources = {
-        "Lazada " + country: data.get("lazada", pd.DataFrame()),
-        "Zalora " + country: data.get("zalora", pd.DataFrame()),
+const IMAGE_REGION_FND_CODES = ["SEA", "PHL", "IND"]; // Global is checked first via the base "global" path/no fnd param variant
+const IMAGE_RESOLVED_COL = 40; // New column on Input sheet holding the final image URL(s)
+
+function resolveImageURLsForSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const inputSheet = ss.getSheetByName("Input");
+  if (!inputSheet) throw new Error("Input sheet not found (resolveImageURLsForSheet)");
+
+  const lastRow = inputSheet.getLastRow();
+  if (lastRow < 2) return;
+
+  inputSheet.getRange(1, IMAGE_RESOLVED_COL).setValue("Resolved Image URL");
+
+  const BASE = "https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:ffffff,w_1000,h_1000/global/";
+  const SUFFIX_TEMPLATE = "/fnd/{REGION}/fmt/jpg/";
+
+  const data = inputSheet.getRange(2, 1, lastRow - 1, 14).getValues(); // need col I (colorNo, idx8) and N (division, idx13)
+  const results = [];
+
+  for (let i = 0; i < data.length; i++) {
+    const colorNoRaw = data[i][8];   // Column I
+    const division = data[i][13];    // Column N
+    const colorNo = colorNoRaw ? colorNoRaw.toString().trim().toUpperCase() : "";
+
+    if (!colorNo || !division) {
+      results.push([""]);
+      continue;
     }
 
-    frames = []
-    for mp_name, df in mp_sources.items():
-        if df is None or df.empty or "SKU" not in df.columns:
-            continue
-
-        apply_buffer = _needs_buffer(mp_name)
-        ecom_map  = _build_ecom_map(zecom, mp_name)
-        stock_map = _build_stock_map(all_df, apply_buffer)
-        launch_map = _build_launch_map(zecom, mp_name)
-        future_launch_map = _build_future_launch_map(zecom, mp_name)
-
-        df = df.copy()
-        df["SKU_orig"] = df["SKU"]
-        df["SKU"] = df["SKU"].apply(_safe_str)
-        df["SKU_clean"] = df["SKU"].apply(_clean_sku)
-
-        # 1. Filter out SKUs longer than 13 characters
-        df = df[df["SKU_clean"].str.len() <= 13]
-
-        tc_df = pd.DataFrame.from_dict(tc_map, orient="index")
-        stock_df = pd.DataFrame.from_dict(stock_map, orient="index")
-        
-        art_series = pd.Series(article_map, name="Article No")
-        ecom_series = pd.Series(ecom_map, name="Ecom Status")
-        
-        df = df.join(art_series, on="SKU_clean")
-        df["Article No"] = df["Article No"].fillna("")
-        
-        # Check if Future Launch is True
-        df["Future Launch"] = df["Article No"].apply(_normalise_article_no).map(future_launch_map).fillna(False)
-
-        # Map raw Ecom Status on the fly using normalised Article No
-        df["Ecom Status"] = df["Article No"].apply(_normalise_article_no).map(ecom_map)
-        
-        # Resolve e-com (Yes/No) and ECOM Status columns
-        ecom_raw = df["Ecom Status"]
-        ecom_raw_clean = ecom_raw.fillna("").astype(str).str.strip()
-        ecom_raw_val = np.where((ecom_raw_clean == "") | (ecom_raw.isna()) | (df["Article No"] == ""), "#N/A", ecom_raw_clean)
-        ecom_raw_std = _standardise_raw_ecom_series(pd.Series(ecom_raw_val, index=df.index))
-        
-        df["e-com (Yes/No)"] = np.where(df["Future Launch"], "Future", ecom_raw_std)
-        df["ECOM Status"] = np.where(df["e-com (Yes/No)"] == "Yes", "Active", "Inactive")
-        
-        df = df.join(tc_df, on="SKU_clean")
-        df["TC SKU"] = df["TC SKU"].fillna("")
-        df["TC Status"] = df["TC Status"].fillna("Unknown")
-        df["Max 0"] = df["Max 0"].fillna("No")
-        
-        # Keep track if SKU was found in TC Inventory
-        tc_found = df["SKU_clean"].isin(tc_df.index)
-        
-        df = df.join(stock_df, on="SKU_clean")
-        df["TC Stock"] = df["TC Stock"].fillna(0.0)
-        df["Reserved Stock"] = df["Reserved Stock"].fillna(0.0)
-        
-        df["Launch Date"] = df["Article No"].apply(_normalise_article_no).map(launch_map).fillna("")
-        
-        excl_art = df["Article No"].apply(_normalise_article_no).map(excl_map)
-        excl_sku = df["SKU_clean"].map(excl_map)
-        df["Exclusion"] = excl_art.fillna(excl_sku).fillna("")
-        
-        df["SKU Valid"] = df["SKU_clean"].apply(_is_valid_sku)
-        
-        if "MP Status" not in df.columns:
-            df["MP Status"] = "Unknown"
-        else:
-            df["MP Status"] = df["MP Status"].apply(_safe_str)
-            
-        if "MP Stock" not in df.columns:
-            df["MP Stock"] = 0.0
-        else:
-            df["MP Stock"] = pd.to_numeric(df["MP Stock"], errors="coerce").fillna(0.0)
-
-        df["Final Status"] = ""
-        df["Comments"] = ""
-        df["Max Setup"] = ""
-
-        excl_val = df["Exclusion"]
-        has_excl = excl_val.notna() & (excl_val != "")
-
-        # Exclusion = Inactive
-        excl_inactive = has_excl & (excl_val == "Inactive")
-        df.loc[excl_inactive, "Final Status"] = "Inactive"
-        df.loc[excl_inactive, "Comments"] = "Inactive as per AM Request"
-        df.loc[excl_inactive, "Max Setup"] = np.where(df.loc[excl_inactive, "Max 0"] == "Yes", "", "Set max 0")
-
-        # Exclusion = Active
-        excl_active = has_excl & (excl_val == "Active")
-        df.loc[excl_active, "Final Status"] = np.where(df.loc[excl_active, "TC Stock"] >= 1, "Active", "Inactive")
-        df.loc[excl_active, "Comments"] = np.where(df.loc[excl_active, "TC Stock"] >= 1, "Active as per AM Request", "AM Request Active but 0 Stock")
-        df.loc[excl_active, "Max Setup"] = np.where(df.loc[excl_active, "Max 0"] == "Yes", "Remove max", "")
-
-        no_excl = ~has_excl
-        
-        cond_ecom_no = no_excl & (df["ECOM Status"] == "Inactive")
-        df.loc[cond_ecom_no, "Final Status"] = "Inactive"
-        df.loc[cond_ecom_no, "Comments"] = "Due to Ecom No"
-        
-        cond_stock_0 = no_excl & (df["ECOM Status"] == "Active") & (df["TC Stock"] == 0)
-        df.loc[cond_stock_0, "Final Status"] = "Inactive"
-        df.loc[cond_stock_0, "Comments"] = "Due to 0 Stock"
-        
-        cond_active = no_excl & (df["ECOM Status"] == "Active") & (df["TC Stock"] != 0)
-        df.loc[cond_active, "Final Status"] = "Active"
-        df.loc[cond_active, "Comments"] = "Ecom Yes with Stock"
-        
-        comment_is_ecom_no = df["Comments"] == "Due to Ecom No"
-        df.loc[no_excl & comment_is_ecom_no & (df["Max 0"] == "No"), "Max Setup"] = "Set max 0"
-        
-        comment_is_stock_or_ecom_active = df["Comments"].isin(["Due to 0 Stock", "Ecom Yes with Stock"])
-        df.loc[no_excl & comment_is_stock_or_ecom_active & (df["Max 0"] == "Yes"), "Max Setup"] = "Remove max"
-
-        mp_norm = _normalise_status_series(df["MP Status"])
-        tc_norm = _normalise_status_series(df["TC Status"])
-        fin_norm = df["Final Status"]
-
-        final_check_bool = (mp_norm == tc_norm) & (tc_norm == fin_norm)
-        df["Final Check"] = final_check_bool.astype(str)
-        df["Stock Check"] = (df["MP Stock"] == df["TC Stock"]).astype(str)
-
-        df["Remarks"] = "All Good"
-        not_fc = ~final_check_bool
-        df.loc[not_fc, "Remarks"] = np.where(df.loc[not_fc, "Final Status"] == "Active", "Change to Active", "Change to Inactive")
-
-        fc_not_sc = final_check_bool & (df["MP Stock"] != df["TC Stock"])
-        active_fc_not_sc = fc_not_sc & (df["Final Status"] == "Active")
-        df.loc[active_fc_not_sc, "Remarks"] = np.where(df.loc[active_fc_not_sc, "Reserved Stock"] != 0, "Due to Reserved Stock", "Make Impact")
-
-        inactive_fc_not_sc = fc_not_sc & (df["Final Status"] != "Active")
-        df.loc[inactive_fc_not_sc, "Remarks"] = "Stock not pushed due to Inactive Status"
-
-        df["Update 0"] = np.where((df["TC Stock"] <= 0) & (df["MP Stock"] > 0), "Yes", "")
-
-        # Convert numeric columns to object type to allow string '#N/A' overwrites for invalid rows
-        for col in ["TC Stock", "Reserved Stock"]:
-            if col in df.columns:
-                df[col] = df[col].astype(object)
-
-        # Handle Invalid SKUs
-        invalid_mask = ~df["SKU Valid"]
-        df.loc[invalid_mask, "TC SKU"] = np.where(df.loc[invalid_mask, "TC SKU"] != "", df.loc[invalid_mask, "TC SKU"], "#N/A")
-        df.loc[invalid_mask, "Article No"] = np.where(df.loc[invalid_mask, "Article No"] != "", df.loc[invalid_mask, "Article No"], "#N/A")
-        df.loc[invalid_mask, "MP Status"] = np.where(df.loc[invalid_mask, "MP Status"] != "", df.loc[invalid_mask, "MP Status"], "#N/A")
-        df.loc[invalid_mask, "TC Status"] = "#N/A"
-        df.loc[invalid_mask, "e-com (Yes/No)"] = "#N/A"
-        df.loc[invalid_mask, "Launch Date"] = np.where(df.loc[invalid_mask, "Launch Date"] != "", df.loc[invalid_mask, "Launch Date"], "#N/A")
-        df.loc[invalid_mask, "Exclusion"] = np.where(df.loc[invalid_mask, "Exclusion"] != "", df.loc[invalid_mask, "Exclusion"], "#N/A")
-        df.loc[invalid_mask, "ECOM Status"] = "#N/A"
-        df.loc[invalid_mask, "Final Status"] = "Invalid"
-        df.loc[invalid_mask, "Comments"] = "Invalid SKU"
-        df.loc[invalid_mask, "Final Check"] = "False"
-        df.loc[invalid_mask, "TC Stock"] = "#N/A"
-        df.loc[invalid_mask, "Reserved Stock"] = "#N/A"
-        df.loc[invalid_mask, "Max 0"] = "#N/A"
-        df.loc[invalid_mask, "Stock Check"] = "False"
-        df.loc[invalid_mask, "Remarks"] = "Invalid SKU"
-        df.loc[invalid_mask, "Max Setup"] = "#N/A"
-        df.loc[invalid_mask, "Update 0"] = "#N/A"
-
-        # Apply TC Status and Remarks override for missing TC Status
-        df.loc[~tc_found, "TC Status"] = "#N/A"
-        df.loc[~tc_found, "Remarks"] = "Import"
-
-        df["Marketplace"] = mp_name
-        df["Seller SKU"] = df["SKU_orig"]
-
-        out_cols = [
-            "Marketplace", "Seller SKU", "TC SKU", "Article No", "MP Status",
-            "TC Status", "e-com (Yes/No)", "Launch Date", "Exclusion", "ECOM Status",
-            "MP Stock", "TC Stock", "Reserved Stock", "Max 0",
-            "Final Status", "Comments", "Final Check", "Stock Check", "Remarks",
-            "Max Setup", "Update 0"
-        ]
-        frames.append(df[out_cols])
-
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-# ── PID-level validation (Shopee + TikTok) ────────────────────────────────────
-
-def run_pid_validation(data, country):
-    content   = data.get("content",   pd.DataFrame())
-    tc_inv    = data.get("tc_inv",    pd.DataFrame())
-    zecom     = data.get("zecom",     pd.DataFrame())
-    all_df    = data.get("all_file",  pd.DataFrame())
-    exclusion = data.get("exclusion", pd.DataFrame())
-
-    excl_map    = _build_excl_map(exclusion)
-    article_map = _build_article_map(content)
-    tc_map      = _build_tc_map(tc_inv)
-
-    mp_sources = {
-        "Shopee " + country: data.get("shopee", pd.DataFrame()),
+    const colorPath = colorNo.replace(/_/g, "/") + "/";
+    let imageCodes = [];
+    if (division === "Accessories" || division === "Footwear") {
+      imageCodes = ["sv01", "sv02", "sv03", "sv04", "bv", "mod01", "mod02", "mod03"];
+    } else if (division === "Apparel") {
+      imageCodes = ["bv", "dt01", "mod01", "mod02", "mod03", "mod04", "mod05"];
     }
-    if country == "MY":
-        mp_sources["TikTok MY"] = data.get("tiktok", pd.DataFrame())
 
-    frames = []
-    for mp_name, df in mp_sources.items():
-        if df is None or df.empty or "SKU" not in df.columns:
-            continue
+    const resolvedUrl = findFirstValidImageAcrossRegions(BASE, colorPath, imageCodes, SUFFIX_TEMPLATE);
+    results.push([resolvedUrl || ""]);
+  }
 
-        apply_buffer = _needs_buffer(mp_name)
-        ecom_map  = _build_ecom_map(zecom, mp_name)
-        stock_map = _build_stock_map(all_df, apply_buffer)
-        launch_map = _build_launch_map(zecom, mp_name)
-        future_launch_map = _build_future_launch_map(zecom, mp_name)
+  inputSheet.getRange(2, IMAGE_RESOLVED_COL, results.length, 1).setValues(results);
+  SpreadsheetApp.flush();
+}
 
-        df = df.copy()
-        df["SKU_orig"] = df["SKU"]
-        df["SKU"] = df["SKU"].apply(_safe_str)
-        df["SKU_clean"] = df["SKU"].apply(_clean_sku)
-        
-        # 1. Filter out SKUs longer than 13 characters
-        df = df[df["SKU_clean"].str.len() <= 13]
+/**
+ * Checks Global first, then SEA, PHL, IND in order. Returns the first valid,
+ * non-"Coming Soon" image URL found, or "" if none exist in any region.
+ */
+function findFirstValidImageAcrossRegions(base, colorPath, imageCodes, suffixTemplate) {
+  // Tier 1: Global (no /fnd/REGION/ segment — uses the plain "/fmt/jpg/" suffix)
+  const globalSuffix = "/fmt/jpg/";
+  for (const code of imageCodes) {
+    const url = base + colorPath + code + globalSuffix;
+    const status = checkImageStatus(url);
+    if (status === "VALID") return url;
+    // status === "COMING_SOON" or "INVALID" -> keep checking other codes in this tier
+  }
 
-        df["Product ID"] = df.get("Product ID", df["SKU"]).apply(_safe_str)
-        if "MP Status" not in df.columns:
-            df["MP Status"] = "Unknown"
-        else:
-            df["MP Status"] = df["MP Status"].apply(_safe_str)
-            
-        if "MP Stock" not in df.columns:
-            df["MP Stock"] = 0.0
-        else:
-            df["MP Stock"] = pd.to_numeric(df["MP Stock"], errors="coerce").fillna(0.0)
+  // Tiers 2-4: SEA, PHL, IND
+  for (const region of IMAGE_REGION_FND_CODES) {
+    const suffix = suffixTemplate.replace("{REGION}", region);
+    for (const code of imageCodes) {
+      const url = base + colorPath + code + suffix;
+      const status = checkImageStatus(url);
+      if (status === "VALID") return url;
+    }
+  }
 
-        tc_df = pd.DataFrame.from_dict(tc_map, orient="index")
-        stock_df = pd.DataFrame.from_dict(stock_map, orient="index")
-        art_series = pd.Series(article_map, name="Article No")
-        ecom_series = pd.Series(ecom_map, name="Ecom Status")
-        
-        df = df.join(art_series, on="SKU_clean")
-        df["Article No"] = df["Article No"].fillna("")
-        
-        # Check if Future Launch is True
-        df["Future Launch"] = df["Article No"].apply(_normalise_article_no).map(future_launch_map).fillna(False)
+  return ""; // Nothing found in any region/tier
+}
 
-        # Map raw Ecom Status on the fly using normalised Article No
-        df["Ecom Status"] = df["Article No"].apply(_normalise_article_no).map(ecom_map)
-        
-        # Resolve e-com (Yes/No) and ECOM Status columns
-        ecom_raw = df["Ecom Status"]
-        ecom_raw_clean = ecom_raw.fillna("").astype(str).str.strip()
-        ecom_raw_val = np.where((ecom_raw_clean == "") | (ecom_raw.isna()) | (df["Article No"] == ""), "#N/A", ecom_raw_clean)
-        ecom_raw_std = _standardise_raw_ecom_series(pd.Series(ecom_raw_val, index=df.index))
-        
-        df["e-com (Yes/No)"] = np.where(df["Future Launch"], "Future", ecom_raw_std)
-        df["ECOM Status"] = np.where(df["e-com (Yes/No)"] == "Yes", "Active", "Inactive")
-        
-        df = df.join(tc_df, on="SKU_clean")
-        df["TC SKU"] = df["TC SKU"].fillna("")
-        df["TC Status"] = df["TC Status"].fillna("Unknown")
-        df["Max 0"] = df["Max 0"].fillna("No")
-        
-        # Keep track if SKU was found in TC Inventory
-        tc_found = df["SKU_clean"].isin(tc_df.index)
-        
-        df = df.join(stock_df, on="SKU_clean")
-        df["TC Stock"] = df["TC Stock"].fillna(0.0)
-        df["Reserved Stock"] = df["Reserved Stock"].fillna(0.0)
-        
-        df["Launch Date"] = df["Article No"].apply(_normalise_article_no).map(launch_map).fillna("")
-        
-        excl_art = df["Article No"].apply(_normalise_article_no).map(excl_map)
-        excl_sku = df["SKU_clean"].map(excl_map)
-        df["Exclusion"] = excl_art.fillna(excl_sku).fillna("")
-        
-        df["SKU Valid"] = df["SKU_clean"].apply(_is_valid_sku)
-        df["Ecom Logic"] = df["ECOM Status"]
+/**
+ * Returns "VALID", "COMING_SOON", or "INVALID".
+ * "Coming Soon" placeholders are detected either by a non-200 response or by an
+ * unusually small image (PUMA's placeholder is a fixed small graphic) — adjust the
+ * dimension/byte-size heuristic below if your placeholder differs.
+ */
+function checkImageStatus(url) {
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return "INVALID";
 
-        # Dual Status
-        pid_active = df[df["Ecom Logic"] == "Active"]["Product ID"].unique()
-        pid_inactive = df[df["Ecom Logic"] == "Inactive"]["Product ID"].unique()
-        dual_pids = set(pid_active) & set(pid_inactive)
-        df["Dual Status"] = np.where(df["Product ID"].isin(dual_pids), 2, 1)
+    const blob = res.getBlob();
+    const img = ImagesService.openImage(blob);
+    const width = img.getWidth();
+    const height = img.getHeight();
 
-        # Consolidated TC Stock
-        df["Consolidated SUM QTY"] = df.groupby("Product ID")["TC Stock"].transform("sum")
+    // Reject tiny placeholder-sized images (typical "Coming Soon" graphics are small).
+    if (width < 650 || height < 650) return "COMING_SOON";
 
-        df["Final Status"] = ""
-        df["Comments"] = ""
-        df["Max Setup"] = ""
+    return "VALID";
+  } catch (e) {
+    return "INVALID";
+  }
+}
 
-        excl_val = df["Exclusion"]
-        has_excl = excl_val.notna() & (excl_val != "")
+/* -------------------------------------------------------------------------------------
+ * Basic validation pass so bad input fails fast with a clear message instead of
+ * crashing deep inside output generation.
+ * ------------------------------------------------------------------------------------- */
+function validateInputSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const inputSheet = ss.getSheetByName("Input");
+  if (!inputSheet) throw new Error("Input sheet not found");
+  const lastRow = inputSheet.getLastRow();
+  if (lastRow < 2) throw new Error("Input sheet has no data rows to process");
+  Logger.log("Input validation passed: " + (lastRow - 1) + " data rows found.");
+}
 
-        # Exclusion = Inactive
-        excl_inactive = has_excl & (excl_val == "Inactive")
-        df.loc[excl_inactive, "Final Status"] = "Inactive"
-        df.loc[excl_inactive, "Comments"] = "Inactive as per AM Request"
-        df.loc[excl_inactive, "Max Setup"] = np.where(df.loc[excl_inactive, "Max 0"] == "Yes", "", "Set max 0")
+/* =====================================================================================
+ * SECTION B: OUTPUT GENERATION
+ * =====================================================================================
+ * Reads the already-resolved Input sheet (title/description with fallback applied,
+ * size with JPN fallback + skip flags applied, image URLs pre-resolved) and writes
+ * the final Output sheet. No network calls or export-sheet lookups happen here.
+ * ===================================================================================== */
 
-        # Exclusion = Active
-        excl_active = has_excl & (excl_val == "Active")
-        df.loc[excl_active, "Final Status"] = np.where(df.loc[excl_active, "Consolidated SUM QTY"] >= 1, "Active", "Inactive")
-        df.loc[excl_active, "Comments"] = np.where(df.loc[excl_active, "Consolidated SUM QTY"] >= 1, "Active as per AM Request", "AM Request Active but 0 Stock")
-        df.loc[excl_active, "Max Setup"] = np.where(df.loc[excl_active, "Max 0"] == "Yes", "Remove max", "")
+function runOutputGeneration() {
+  var amountMap = constructAmountMap();
+  var quantityMap = constructQuantityMap();
+  var categoryMap = constructCategoryMap();
+  var styleCountMap = countNoOfItems();
+  buildOutputSheet(amountMap, quantityMap, categoryMap, styleCountMap);
+}
 
-        no_excl = ~has_excl
-        
-        # Dual Status = 1
-        ds1 = no_excl & (df["Dual Status"] == 1)
-        
-        cond_ds1_ecom_no = ds1 & (df["Ecom Logic"] == "Inactive")
-        df.loc[cond_ds1_ecom_no, "Final Status"] = "Inactive"
-        df.loc[cond_ds1_ecom_no, "Comments"] = "Due to Ecom No"
-        
-        cond_ds1_stock_0 = ds1 & (df["Ecom Logic"] != "Inactive") & (df["Consolidated SUM QTY"] == 0)
-        df.loc[cond_ds1_stock_0, "Final Status"] = "Inactive"
-        df.loc[cond_ds1_stock_0, "Comments"] = "Due to 0 Stock"
-        
-        cond_ds1_active = ds1 & (df["Ecom Logic"] != "Inactive") & (df["Consolidated SUM QTY"] != 0)
-        df.loc[cond_ds1_active, "Final Status"] = "Active"
-        df.loc[cond_ds1_active, "Comments"] = "Ecom Yes with Stock"
-        
-        # Dual Status = 2
-        ds2 = no_excl & (df["Dual Status"] == 2)
-        
-        cond_ds2_stock_0 = ds2 & (df["Consolidated SUM QTY"] == 0)
-        df.loc[cond_ds2_stock_0, "Final Status"] = "Inactive"
-        df.loc[cond_ds2_stock_0, "Comments"] = "Due to 0 Stock"
-        
-        cond_ds2_active_ecom = ds2 & (df["Consolidated SUM QTY"] != 0) & (df["Ecom Logic"] == "Active")
-        df.loc[cond_ds2_active_ecom, "Final Status"] = "Active"
-        df.loc[cond_ds2_active_ecom, "Comments"] = "Ecom Yes with Stock"
-        
-        cond_ds2_set_max = ds2 & (df["Consolidated SUM QTY"] != 0) & (df["Ecom Logic"] != "Active")
-        df.loc[cond_ds2_set_max, "Final Status"] = "Active"
-        df.loc[cond_ds2_set_max, "Comments"] = "Set max"
+function buildOutputSheet(amountMap, quantityMap, categoryMap, styleCountMap) {
+  var main = SpreadsheetApp.getActive().getSheetByName("Output");
+  var inputSheet = SpreadsheetApp.getActive().getSheetByName("Input");
+  var processedStyle = [];
+  var index = 2;
+  var parentRow = 2;
+  var processedParentCount = 0;
+  var currentParentIndex = 2;
+  var childIndex = 0;
+  var childUpdateIndexMap = {};
 
-        # Max Setup logic for no_excl
-        comment_is_ecom_no_or_set_max = df["Comments"].isin(["Due to Ecom No", "Set max"])
-        df.loc[no_excl & comment_is_ecom_no_or_set_max & (df["Max 0"] == "No"), "Max Setup"] = "Set max"
-        
-        comment_is_ecom_stock = df["Comments"] == "Ecom Yes with Stock"
-        df.loc[no_excl & comment_is_ecom_stock & (df["Max 0"] == "Yes"), "Max Setup"] = "Remove max"
-        
-        comment_is_stock_0 = df["Comments"] == "Due to 0 Stock"
-        ecom_yn_yes = df["ECOM Status"] == "Active"
-        ecom_yn_no = df["ECOM Status"] == "Inactive"
-        df.loc[no_excl & comment_is_stock_0 & ecom_yn_yes & (df["Max 0"] == "Yes"), "Max Setup"] = "Remove max"
-        df.loc[no_excl & comment_is_stock_0 & ecom_yn_no & (df["Max 0"] == "No"), "Max Setup"] = "Set max"
+  for (var i = 2; i <= inputSheet.getLastRow(); i++) {
+    if (i == 2) {
+      createHeadingForTargetSheet(main);
+    }
 
-        mp_norm = _normalise_status_series(df["MP Status"])
-        tc_norm = _normalise_status_series(df["TC Status"])
-        fin_norm = df["Final Status"]
+    // ---- REQUIREMENT #2/#3: skip rows flagged during input processing instead of
+    // letting mismatched size formats throw errors downstream. ----
+    if (isRowSkipped(inputSheet, i)) {
+      continue;
+    }
 
-        final_check_bool = (mp_norm == tc_norm) & (tc_norm == fin_norm)
-        df["Final Check"] = final_check_bool.astype(str)
-        df["Stock Check"] = (df["MP Stock"] == df["TC Stock"]).astype(str)
+    var style;
+    var style_next_row;
+    var products = inputSheet.getRange(i, 14).getValue();
+    if (products == "Footwear") {
+      style = inputSheet.getRange(i, 9).getValue();
+      style_next_row = inputSheet.getRange(i + 1, 9).getValue();
+    } else {
+      style = inputSheet.getRange(i, 1).getValue();
+      style_next_row = inputSheet.getRange(i + 1, 1).getValue();
+    }
 
-        # Remarks
-        df["Remarks"] = "All Good"
-        not_fc = ~final_check_bool
-        df.loc[not_fc, "Remarks"] = "Update status to " + df.loc[not_fc, "Final Status"]
+    if ((styleCountMap[style] == 1) || ((style == style_next_row) && processedStyle.indexOf(style) == -1)) {
+      fillParentRow(main, inputSheet, index, i, categoryMap, amountMap, styleCountMap, childUpdateIndexMap);
+      currentParentIndex = index;
+      if (styleCountMap[style] > 1) {
+        parentRow = i + processedParentCount;
+        processedParentCount++;
+      }
+      index++;
+    }
+    if (styleCountMap[style] == 1) {
+      continue;
+    }
 
-        fc_not_sc = final_check_bool & (df["MP Stock"] != df["TC Stock"])
-        
-        active_fc_not_sc = fc_not_sc & (df["Final Status"] == "Active")
-        df.loc[active_fc_not_sc, "Remarks"] = np.select(
-            [
-                df.loc[active_fc_not_sc, "Comments"] == "Set max",
-                df.loc[active_fc_not_sc, "Reserved Stock"] != 0
-            ],
-            [
-                "Set max product",
-                "Due to Reserved Stock"
-            ],
-            default="Make Impact"
-        )
+    var customSku = inputSheet.getRange(i, 16).getValue();
+    var variation1 = inputSheet.getRange(i, 12).getValue();
+    var newVariation1 = variation1.includes("Puma") ? variation1.replace("Puma", "PUMA") : variation1;
 
-        inactive_fc_not_sc = fc_not_sc & (df["Final Status"] != "Active")
-        df.loc[inactive_fc_not_sc, "Remarks"] = "Stock not pushed due to Inactive Status"
+    // ---- Use effective size (UK or JPN fallback) instead of raw variation2() ----
+    var variationTwo = getEffectiveSize(inputSheet, i);
+    var temp_var_2 = variationTwo;
+    if (temp_var_2 && temp_var_2.indexOf(" L") != -1) {
+      temp_var_2 = temp_var_2.replace("Int:W", "").replace("Int:", "").replace("W", "").replace(" L", "/");
+    }
+    var mappingKey = variation1 + "_" + (temp_var_2 || "")
+      .replace("UK:", "").replace("FR:", "").replace("US:", "").replace("ASIA:", "").replace("Int:", "")
+      .replace(" yrs", "Y").replace("W", "").replace(" L", "/");
 
-        # Convert numeric columns to object type to allow string '#N/A' overwrites for invalid rows
-        for col in ["TC Stock", "Reserved Stock"]:
-            if col in df.columns:
-                df[col] = df[col].astype(object)
+    childIndex = childUpdateIndexMap[mappingKey];
+    if (childIndex === undefined) {
+      // Mapping key not found (e.g. size sort didn't register this row) — skip safely.
+      continue;
+    }
+    childIndex = childIndex + parentRow + 1;
+    main.getRange(childIndex, 11).setValue(variationTwo);
+    processedStyle.push(style);
 
-        # Handle Invalid SKUs
-        invalid_mask = ~df["SKU Valid"]
-        df.loc[invalid_mask, "TC SKU"] = np.where(df.loc[invalid_mask, "TC SKU"] != "", df.loc[invalid_mask, "TC SKU"], "#N/A")
-        df.loc[invalid_mask, "Product ID"] = np.where(df.loc[invalid_mask, "Product ID"] != "", df.loc[invalid_mask, "Product ID"], "#N/A")
-        df.loc[invalid_mask, "Article No"] = np.where(df.loc[invalid_mask, "Article No"] != "", df.loc[invalid_mask, "Article No"], "#N/A")
-        df.loc[invalid_mask, "MP Status"] = np.where(df.loc[invalid_mask, "MP Status"] != "", df.loc[invalid_mask, "MP Status"], "#N/A")
-        df.loc[invalid_mask, "TC Status"] = "#N/A"
-        df.loc[invalid_mask, "e-com (Yes/No)"] = "#N/A"
-        df.loc[invalid_mask, "Launch Date"] = np.where(df.loc[invalid_mask, "Launch Date"] != "", df.loc[invalid_mask, "Launch Date"], "#N/A")
-        df.loc[invalid_mask, "Exclusion"] = np.where(df.loc[invalid_mask, "Exclusion"] != "", df.loc[invalid_mask, "Exclusion"], "#N/A")
-        df.loc[invalid_mask, "ECOM Status"] = "#N/A"
-        df.loc[invalid_mask, "Final Status"] = "Invalid"
-        df.loc[invalid_mask, "Comments"] = "Invalid SKU"
-        df.loc[invalid_mask, "Final Check"] = "False"
-        df.loc[invalid_mask, "TC Stock"] = "#N/A"
-        df.loc[invalid_mask, "Reserved Stock"] = "#N/A"
-        df.loc[invalid_mask, "Max 0"] = "#N/A"
-        df.loc[invalid_mask, "Stock Check"] = "False"
-        df.loc[invalid_mask, "Remarks"] = "Invalid SKU"
-        df.loc[invalid_mask, "Max Setup"] = "#N/A"
-        df.loc[invalid_mask, "Update 0"] = "#N/A"
+    var amountMapValue = amountMap[customSku];
+    var itemAmount, salePrice;
+    if (amountMapValue != "" && amountMapValue != undefined) {
+      itemAmount = amountMapValue[3];
+      salePrice = amountMapValue[4];
+    } else {
+      main.getRange(childIndex, 17).setValue("error");
+      main.getRange(childIndex, 14).setValue("error");
+    }
 
-        # Apply TC Status and Remarks override for missing TC Status
-        df.loc[~tc_found, "TC Status"] = "#N/A"
-        df.loc[~tc_found, "Remarks"] = "Import"
+    var ageGroup = inputSheet.getRange(i, 4).getValue();
+    var articleGroup = inputSheet.getRange(i, 6).getValue();
+    var brand = inputSheet.getRange(i, 3).getValue();
+    // ---- REQUIREMENT #1: title now comes from the resolved (fallback-applied) column ----
+    var regionalDispalyName = inputSheet.getRange(i, RESOLVED_TITLE_COL).getValue();
+    var gender = inputSheet.getRange(i, 5).getValue();
+    var activityGroup = inputSheet.getRange(i, 8).getValue();
+    var articleType = inputSheet.getRange(i, 7).getValue();
+    var searchColorName = inputSheet.getRange(i, 13).getValue();
+    var colorName = inputSheet.getRange(i, 9).getValue();
 
-        df["Marketplace"] = mp_name
-        df["SellerSku"] = df["SKU_orig"]
+    var newRegionalDisplayName = regionalDispalyName.includes("’s") ? regionalDispalyName.replace("’s", "'s™") : regionalDispalyName;
+    var getSearchColorName;
+    if (searchColorName && searchColorName.includes(' - ')) {
+      getSearchColorName = searchColorName.split(' - ')[1];
+    }
 
-        out_cols = [
-            "Marketplace", "SellerSku", "TC SKU", "Product ID", "Article No", "MP Status",
-            "TC Status", "e-com (Yes/No)", "Launch Date", "Exclusion", "ECOM Status",
-            "Final Status", "Comments", "Final Check", "Dual Status", "Consolidated SUM QTY",
-            "MP Stock", "TC Stock", "Reserved Stock", "Max 0", "Stock Check",
-            "Remarks", "Max Setup", "Update 0"
-        ]
-        frames.append(df[out_cols])
+    var title, itemTitle;
+    if (regionalDispalyName.includes("Men") || regionalDispalyName.includes("Women")) {
+      title = formTitle(brand, newRegionalDisplayName, activityGroup, articleType, "", getSearchColorName, products);
+    } else {
+      title = formTitle(brand, newRegionalDisplayName, activityGroup, articleType, gender, getSearchColorName, products);
+    }
+    itemTitle = removeDuplicates(title);
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    var mappedKey = ageGroup + '-' + gender + '-' + articleGroup + '-' + articleType + '-' + activityGroup;
+    var categoryMapValue = categoryMap[mappedKey];
+    if (categoryMapValue != undefined && categoryMapValue.length > 0) {
+      main.getRange(childIndex, 21).setValue(categoryMapValue[1]);
+    } else {
+      main.getRange(childIndex, 21).setValue("error");
+    }
 
+    main.getRange(childIndex, 4).setValue(customSku);
+    main.getRange(childIndex, 5).setValue(replaceSplCharacter(itemTitle));
+    if (salePrice != undefined && salePrice != "") {
+      main.getRange(childIndex, 14).setValue(salePrice);
+    }
+    main.getRange(childIndex, 10).setValue(newVariation1);
+    fillDefaultValues(main, childIndex, amountMapValue);
+    main.getRange(childIndex, 17).setValue(itemAmount);
+    main.getRange(childIndex, 19).setValue(0);
+    main.getRange(childIndex, 23).setValue(brand);
+    main.getRange(childIndex, 24).setValue(colorName);
+    main.getRange(childIndex, 30).setValue("1 X " + replaceSplCharacter(itemTitle));
+    main.getRange(childIndex, 31).setValue("sku.color_family=[\"" + newVariation1 + "\",]");
+    main.getRange(childIndex, 32).setValue("sku.size=[\"" + variationTwo + "\",]");
+    main.getRange(currentParentIndex, 31).setValue(main.getRange(currentParentIndex + 1, 31).getValue());
+    main.getRange(currentParentIndex, 32).setValue(main.getRange(currentParentIndex + 1, 32).getValue());
 
-# ── Fast Excel Writer ──────────────────────────────────────────────────────────
+    // ---- REQUIREMENT #4: image URL is pre-resolved on Input; just copy it across ----
+    var resolvedImage = inputSheet.getRange(i, IMAGE_RESOLVED_COL).getValue();
+    if (resolvedImage) {
+      main.getRange(childIndex, 20).setValue(resolvedImage);
+    }
 
-def save_df_to_excel_fast(sheets, file_or_buffer):
-    """
-    Write DataFrames to Excel with auto-fitted column widths, center alignment,
-    bold light blue headers, and a Summary sheet with side-by-side pivot tables
-    for Remarks and Max Setup.
-    """
-    import xlsxwriter
-    import pandas as pd
-    import numpy as np
-    from collections import Counter
+    index++;
+  }
+}
 
-    # 1. Generate Summary data
-    all_remarks = []
-    all_max_setup = []
-    for df in sheets.values():
-        if "Remarks" in df.columns:
-            all_remarks.extend(df["Remarks"].fillna("").astype(str).str.strip().tolist())
-        if "Max Setup" in df.columns:
-            all_max_setup.extend(df["Max Setup"].fillna("").astype(str).str.strip().tolist())
-    
-    clean_remarks = [r for r in all_remarks if r and r not in ("", "#N/A", "nan", "None")]
-    clean_max_setup = [m for m in all_max_setup if m and m not in ("", "#N/A", "nan", "None")]
-    
-    remarks_counts = Counter(clean_remarks).most_common()
-    max_setup_counts = Counter(clean_max_setup).most_common()
-    
-    # 2. Re-order sheets so Summary is first
-    ordered_sheets = {"Summary": pd.DataFrame()}
-    for k, v in sheets.items():
-        ordered_sheets[k] = v
+/* -------------------------------------------------------------------------------------
+ * REQUIREMENT #5 — Short Description optional + Color Number removed from output
+ * ------------------------------------------------------------------------------------- */
+function getShortDescription(shortDescription, brand, searchColorName, gender, activityGroup, collection, material, materialLocal, upperMaterial,
+  midSoleMaterial, outerSoleMaterial, shellMaterial, toeType,
+  heelType, fastener, fit, pumaTechnology, technologyPurpose, inputSheet, index, style) {
 
-    # 3. Create Workbook
-    workbook = xlsxwriter.Workbook(file_or_buffer, {'nan_inf_to_errors': True})
-    
-    # Define formats
-    header_format = workbook.add_format({
-        'bold': True,
-        'bg_color': '#DBEAFE',      # Light Blue background
-        'font_color': '#1E3A8A',    # Dark Blue text
-        'align': 'center',
-        'valign': 'vcenter',
-        'border': 1,
-        'border_color': '#93C5FD'
-    })
-    
-    header_left_format = workbook.add_format({
-        'bold': True,
-        'bg_color': '#DBEAFE',
-        'font_color': '#1E3A8A',
-        'align': 'left',
-        'valign': 'vcenter',
-        'border': 1,
-        'border_color': '#93C5FD'
-    })
-    
-    header_right_format = workbook.add_format({
-        'bold': True,
-        'bg_color': '#DBEAFE',
-        'font_color': '#1E3A8A',
-        'align': 'right',
-        'valign': 'vcenter',
-        'border': 1,
-        'border_color': '#93C5FD'
-    })
+  // Short Description is now optional — default to empty string instead of failing.
+  var shortDesc = (shortDescription != undefined && shortDescription != null) ? shortDescription : "";
 
-    cell_format = workbook.add_format({
-        'align': 'center',
-        'valign': 'vcenter',
-        'border': 1,
-        'border_color': '#E5E7EB'
-    })
+  if (brand) shortDesc += "<li>Brand : " + brand + "</li>";
 
-    remarks_format = workbook.add_format({
-        'align': 'left',
-        'valign': 'vcenter',
-        'border': 1,
-        'border_color': '#E5E7EB'
-    })
+  // Strip any embedded color number pattern from the color name before using it
+  // (e.g. "01 - Black" -> "Black"), so no color codes leak into the description.
+  if (searchColorName) {
+    var cleanedColorName = searchColorName.toString().replace(/^\s*\d+\s*-\s*/, "").trim();
+    if (cleanedColorName) shortDesc += "<li>Color Name : " + cleanedColorName + "</li>";
+  }
 
-    right_format = workbook.add_format({
-        'align': 'right',
-        'valign': 'vcenter',
-        'border': 1,
-        'border_color': '#E5E7EB'
-    })
+  if (gender) shortDesc += "<li>Gender : " + gender + "</li>";
+  if (activityGroup) shortDesc += "<li>Activity Group : " + activityGroup + "</li>";
+  if (collection) shortDesc += "<li>Collection : " + collection + "</li>";
 
-    total_left_format = workbook.add_format({
-        'bold': True,
-        'border': 1,
-        'border_color': '#E5E7EB',
-        'bg_color': '#F3F4F6',
-        'align': 'left'
-    })
-    
-    total_right_format = workbook.add_format({
-        'bold': True,
-        'border': 1,
-        'border_color': '#E5E7EB',
-        'bg_color': '#F3F4F6',
-        'align': 'right'
-    })
+  if (material && material != "Other") {
+    var newMaterial = "<li>Material : " + material + "</li>";
+    var main_material_2_present = false;
+    if (newMaterial.indexOf("Main Material 1") != -1) {
+      newMaterial = newMaterial.replace("<li>Material : ", "<li>");
+    }
+    if (newMaterial.indexOf("Main Material 2") != -1) {
+      main_material_2_present = true;
+      newMaterial = newMaterial.replace("<li>Material : ", "<li>");
+      newMaterial = newMaterial.replace("Main Material 2", "</li><li>Main Material 2");
+    }
+    if (newMaterial.indexOf("Main Material 3") != -1) {
+      newMaterial = newMaterial.replace("<li>Material : ", "<li>");
+      newMaterial = main_material_2_present
+        ? newMaterial.replace("Main Material 3", "</li><li>Main Material 3")
+        : newMaterial.replace("Main Material 3", "</li><li>Main Material 2");
+    }
+    shortDesc += newMaterial;
+  }
 
-    for sheet_name, df in ordered_sheets.items():
-        worksheet = workbook.add_worksheet(sheet_name[:31])
-        
-        # ── Case A: Write custom Summary layout ──────────────────────────────────
-        if sheet_name == "Summary":
-            worksheet.set_row(0, 24) # Set header row height
-            
-            # Table 1: Remarks (Cols A and B)
-            worksheet.write(0, 0, "Row Labels", header_left_format)
-            worksheet.write(0, 1, "Count of Remarks", header_right_format)
-            
-            remarks_total = 0
-            current_row = 1
-            for label, cnt in remarks_counts:
-                worksheet.set_row(current_row, 20)
-                worksheet.write_string(current_row, 0, str(label), remarks_format)
-                worksheet.write_number(current_row, 1, cnt, right_format)
-                remarks_total += cnt
-                current_row += 1
-                
-            worksheet.set_row(current_row, 20)
-            worksheet.write_string(current_row, 0, "Grand Total", total_left_format)
-            worksheet.write_number(current_row, 1, remarks_total, total_right_format)
-            
-            # Table 2: Max Setup (Cols D and E)
-            worksheet.write(0, 3, "Row Labels", header_left_format)
-            worksheet.write(0, 4, "Count of Max Setup", header_right_format)
-            
-            max_setup_total = 0
-            current_row = 1
-            for label, cnt in max_setup_counts:
-                worksheet.set_row(current_row, 20)
-                worksheet.write_string(current_row, 3, str(label), remarks_format)
-                worksheet.write_number(current_row, 4, cnt, right_format)
-                max_setup_total += cnt
-                current_row += 1
-                
-            worksheet.set_row(current_row, 20)
-            worksheet.write_string(current_row, 3, "Grand Total", total_left_format)
-            worksheet.write_number(current_row, 4, max_setup_total, total_right_format)
-            
-            # Widths & Spacing
-            worksheet.set_column(2, 2, 4) # Spacer column C
-            
-            max_a = max([len(str(x[0])) for x in remarks_counts] + [len("Row Labels"), len("Grand Total")]) + 3
-            max_b = max([len(str(x[1])) for x in remarks_counts] + [len("Count of Remarks")]) + 3
-            worksheet.set_column(0, 0, max(max_a, 12))
-            worksheet.set_column(1, 1, max(max_b, 16))
-            
-            max_d = max([len(str(x[0])) for x in max_setup_counts] + [len("Row Labels"), len("Grand Total")]) + 3
-            max_e = max([len(str(x[1])) for x in max_setup_counts] + [len("Count of Max Setup")]) + 3
-            worksheet.set_column(3, 3, max(max_d, 12))
-            worksheet.set_column(4, 4, max(max_e, 18))
-            continue
+  if (materialLocal && materialLocal != "Other") shortDesc += "<li>Material Local : " + materialLocal + "</li>";
+  if (upperMaterial && upperMaterial != "Other") shortDesc += "<li>Upper Material : " + upperMaterial + "</li>";
+  if (midSoleMaterial && midSoleMaterial != "Other") shortDesc += "<li>Mid Sole Material : " + midSoleMaterial + "</li>";
+  if (outerSoleMaterial && outerSoleMaterial != "Other") shortDesc += "<li>Outer Sole Material : " + outerSoleMaterial + "</li>";
+  if (shellMaterial && shellMaterial != "Other") shortDesc += "<li>Shell Material : " + shellMaterial + "</li>";
+  if (toeType) shortDesc += "<li>Toe Type : " + toeType + "</li>";
+  if (heelType) shortDesc += "<li>Heel Type : " + heelType + "</li>";
+  if (fastener) shortDesc += "<li>Fastener : " + fastener + "</li>";
+  if (fit) shortDesc += "<li>Fit : " + fit + "</li>";
+  if (pumaTechnology) shortDesc += "<li>PUMA Technology : " + pumaTechnology + "</li>";
+  if (technologyPurpose) shortDesc += "<li>Technology Purpose : " + technologyPurpose + "</li>";
 
-        # ── Case B: Write standard validation sheet layout ──────────────────────
-        if df.empty:
-            continue
-            
-        worksheet.set_row(0, 24) # Set header row height
-        worksheet.write_row(0, 0, list(df.columns), header_format)
-        
-        # Prepare clean data values
-        df_clean = df.fillna("")
-        data_list = df_clean.values.tolist()
-        
-        # Write data rows
-        for row_idx, row in enumerate(data_list, start=1):
-            worksheet.set_row(row_idx, 20) # Set data row height
-            for col_idx, val in enumerate(row):
-                fmt = cell_format
-                if df.columns[col_idx] in ["Remarks", "Comments"]:
-                    fmt = remarks_format
-                
-                # Write matching correct types
-                if isinstance(val, (int, float)) and not pd.isna(val):
-                    worksheet.write_number(row_idx, col_idx, val, fmt)
-                else:
-                    worksheet.write_string(row_idx, col_idx, str(val), fmt)
-        
-        # Auto-fit column widths (sample up to 2000 rows for speed)
-        sample_size = min(len(df_clean), 2000)
-        for col_idx, col_name in enumerate(df.columns):
-            max_len = len(str(col_name))
-            if sample_size > 0:
-                max_len = max(max_len, df_clean.iloc[:sample_size, col_idx].astype(str).str.len().max())
-            worksheet.set_column(col_idx, col_idx, max(max_len + 3, 10))
-            
-    workbook.close()
+  // NOTE: "Style Number" (style) is intentionally NOT appended here — that is the
+  // color/style numeric code the requirement asks to remove from the output.
 
+  return shortDesc;
+}
+
+/* =====================================================================================
+ * UNCHANGED SUPPORT FUNCTIONS (kept from original script, referenced above)
+ * ===================================================================================== */
+
+function replaceSplCharacter(value) {
+  if (value == undefined || value == null) return "";
+  return value.toString()
+    .replace("â€œ", "“").replace("â€", "”").replace("â€˜", "‘").replace("â€™", "’")
+    .replace("â€”", "–").replace("â€“", "—").replace("â€¢", "-").replace("â€¦", "…")
+    .replace("Ã˜", "Ø").replace("Ã‚Â®", "®").replace("Â³", "³").replace("Â®", "®")
+    .replace("Ã¸", "Ÿ").replace("Ã‚", "Ÿ");
+}
+
+function fillDefaultValues(main, index, amountMapValue) {
+  if (amountMapValue != "" && amountMapValue != undefined) {
+    var salePrice = amountMapValue[4];
+    if (salePrice != "") {
+      main.getRange(index, 15).setValue("2024-05-10 00:00:00");
+      main.getRange(index, 16).setValue("2024-06-10 23:59:00");
+    }
+  }
+  main.getRange(index, 6).setValue("userTemplate-PH_PumaAccessories");
+  main.getRange(index, 18).setValue("PHP");
+  main.getRange(index, 22).setValue("default");
+  main.getRange(index, 25).setValue("No Warranty");
+  main.getRange(index, 26).setValue("0.5");
+  main.getRange(index, 27).setValue("15");
+  main.getRange(index, 28).setValue("12");
+  main.getRange(index, 29).setValue("12");
+}
+
+function getItemTitle(regionalDispalyName, brand, gender, activityGroup, articleType, searchColorName, productsDivision) {
+  var title, itemTitle, newRegionalDisplayName, getSearchColorName;
+  newRegionalDisplayName = regionalDispalyName.includes("’s") ? regionalDispalyName.replace("’s", "'s™") : regionalDispalyName;
+  if (searchColorName && searchColorName.includes(' - ')) {
+    getSearchColorName = searchColorName.split(' - ')[1];
+  }
+  if (regionalDispalyName.includes("Men") || regionalDispalyName.includes("Women")) {
+    title = formTitle(brand, newRegionalDisplayName, activityGroup, articleType, "", getSearchColorName, productsDivision);
+  } else {
+    title = formTitle(brand, newRegionalDisplayName, activityGroup, articleType, gender, getSearchColorName, productsDivision);
+  }
+  itemTitle = removeDuplicates(title);
+  return itemTitle;
+}
+
+function formTitle(brand, newRegionalDisplayName, activityGroup, articleType, gender, searchColorName, productsDivision) {
+  var title = "[NEW] ";
+  title += brand.includes("Licence") ? brand.replace("Licence", "PUMA") : brand;
+
+  if (gender != undefined && title.indexOf(gender) == -1) {
+    if (gender == "Unisex") title += " " + gender;
+  }
+
+  if (title.indexOf(newRegionalDisplayName) == -1) {
+    var checkRegionalDisplayName = "";
+    if (newRegionalDisplayName.includes("Trainers")) {
+      checkRegionalDisplayName = newRegionalDisplayName.replace("Trainers", "Shoes");
+      title += " " + checkRegionalDisplayName;
+    } else if (newRegionalDisplayName.includes("Sandals")) {
+      checkRegionalDisplayName = newRegionalDisplayName.replace("Sandals", "Sports Sandals");
+      title += " " + checkRegionalDisplayName;
+    } else if (newRegionalDisplayName.includes("Slides")) {
+      checkRegionalDisplayName = newRegionalDisplayName.replace("Slides", "Slides Slippers");
+      title += " " + checkRegionalDisplayName;
+    } else if (newRegionalDisplayName.includes("Trainer")) {
+      checkRegionalDisplayName = newRegionalDisplayName.replace("Trainer", "Shoes");
+      title += " " + checkRegionalDisplayName;
+    } else {
+      title += " " + newRegionalDisplayName;
+    }
+  }
+
+  if (productsDivision == "Footwear" && title.indexOf(searchColorName) == -1) {
+    title += " (" + searchColorName + ") ";
+  }
+
+  return title;
+}
+
+function countNoOfItems() {
+  var inputSheet = SpreadsheetApp.getActive().getSheetByName("Input");
+  var colorNumberValues = [];
+  var styleValues = [];
+  for (var i = 2; i <= inputSheet.getLastRow(); i++) {
+    if (isRowSkipped(inputSheet, i)) continue; // honor skip flags in counts too
+    var products = inputSheet.getRange(i, 14).getValue();
+    if (products == "Footwear") {
+      colorNumberValues.push(inputSheet.getRange(i, 9).getValue());
+    } else {
+      styleValues.push(inputSheet.getRange(i, 1).getValue());
+    }
+  }
+  var result = {};
+  colorNumberValues.forEach(x => { result[x] = (result[x] || 0) + 1; });
+  styleValues.forEach(x => { result[x] = (result[x] || 0) + 1; });
+  return result;
+}
+
+function fillParentRow(main, inputSheet, index, i, categoryMap, amountMap, styleCountMap, childUpdateIndexMap) {
+  var customSku = inputSheet.getRange(i, 16).getValue();
+  var ageGroup = inputSheet.getRange(i, 4).getValue();
+  var articleGroup = inputSheet.getRange(i, 6).getValue();
+  var brand = inputSheet.getRange(i, 3).getValue();
+  var regionalDispalyName = inputSheet.getRange(i, RESOLVED_TITLE_COL).getValue(); // req #1
+  var gender = inputSheet.getRange(i, 5).getValue();
+  var activityGroup = inputSheet.getRange(i, 8).getValue();
+  var articleType = inputSheet.getRange(i, 7).getValue();
+  var searchColorName = inputSheet.getRange(i, 13).getValue();
+  var longDescription = inputSheet.getRange(i, RESOLVED_LONG_DESC_COL).getValue(); // req #1
+  var collection = inputSheet.getRange(i, 26).getValue();
+  var material = inputSheet.getRange(i, 27).getValue();
+  var materialLocal = inputSheet.getRange(i, 28).getValue();
+  var upperMaterial = inputSheet.getRange(i, 29).getValue();
+  var midSoleMaterial = inputSheet.getRange(i, 30).getValue();
+  var outerSoleMaterial = inputSheet.getRange(i, 31).getValue();
+  var shellMaterial = inputSheet.getRange(i, 32).getValue();
+  var toeType = inputSheet.getRange(i, 33).getValue();
+  var heelType = inputSheet.getRange(i, 34).getValue();
+  var fastener = inputSheet.getRange(i, 66).getValue();
+  var fit = inputSheet.getRange(i, 67).getValue();
+  var pumaTechnology = inputSheet.getRange(i, 35).getValue();
+  var technologyPurpose = inputSheet.getRange(i, 36).getValue();
+  var shortDescription = inputSheet.getRange(i, RESOLVED_SHORT_DESC_COL).getValue(); // req #1 & #5 (optional)
+  var care = inputSheet.getRange(i, 43).getValue();
+  var careLabel = inputSheet.getRange(i, 44).getValue();
+  var productsDivision = inputSheet.getRange(i, 14).getValue();
+
+  var itemTitle = getItemTitle(regionalDispalyName, brand, gender, activityGroup, articleType, searchColorName, productsDivision);
+  main.getRange(index, 5).setValue(replaceSplCharacter(itemTitle));
+  main.getRange(index, 30).setValue("1 X " + replaceSplCharacter(itemTitle));
+
+  var mappedKey = ageGroup + '-' + gender + '-' + articleGroup + '-' + articleType + '-' + activityGroup;
+  var categoryMapValue = categoryMap[mappedKey];
+  var amountMapValue = amountMap[customSku];
+
+  if (amountMapValue != "" && amountMapValue != undefined) {
+    main.getRange(index, 17).setValue(amountMapValue[3]);
+  }
+
+  var act_group = inputSheet.getRange(i, 8).getValue();
+  if (act_group == "Prime/Select") {
+    act_group = "Others";
+  } else if (["Sport Classics", "Evolution", "Basics", "Kids", "Auto"].indexOf(act_group) !== -1) {
+    act_group = "Lifestyle";
+  }
+
+  var val1 = "";
+  if (material.indexOf("100% polyester") != -1) val1 = 'normal.clothing_material=["Polyester",]';
+  else if (material.indexOf("100% nylon") != -1) val1 = 'normal.clothing_material=["Nylon",]';
+  else if (material.indexOf("100% cotton") != -1) val1 = 'normal.clothing_material=["Cotton",]';
+  else if (material.indexOf("polyester") != -1 && material.indexOf("nylon") != -1) val1 = 'normal.clothing_material=["Polyester+Nylon",]';
+  else if (material.indexOf("polyester") != -1 && material.indexOf("cotton") != -1) val1 = 'normal.clothing_material=["Polyester+Cotton",]';
+  else if (material.indexOf("polyester") != -1 && material.indexOf("elastane") != -1) val1 = 'normal.clothing_material=["Polyester+Elasteane",]';
+  else if (material.indexOf("polyester") != -1 && material.indexOf("spandex") != -1) val1 = 'normal.clothing_material=["Polyester+Spandex",]';
+
+  var itemSpecIndex = 33;
+  main.getRange(index, itemSpecIndex).setValue('normal.activity_type=["' + act_group + '",]');
+  if (val1 != "") {
+    itemSpecIndex++;
+    main.getRange(index, itemSpecIndex).setValue(val1);
+  }
+  itemSpecIndex++;
+  main.getRange(index, itemSpecIndex).setValue('normal.delivery_option_economy=["No",]');
+
+  if (articleGroup && articleGroup.toLowerCase() == "tops") {
+    var tops_type = articleType == "Tee" ? "T-Shirts" : (articleType == "Polo" ? "Polo" : "");
+    if (tops_type != "") {
+      itemSpecIndex++;
+      main.getRange(index, itemSpecIndex).setValue('normal.tops_type=["' + tops_type + '",]');
+    }
+  }
+
+  main.getRange(index, 21).setValue(categoryMapValue && categoryMapValue.length > 0 ? categoryMapValue[1] : "error");
+
+  var style = (productsDivision == "Footwear") ? inputSheet.getRange(i, 9).getValue() : inputSheet.getRange(i, 1).getValue();
+
+  var shortDescrition = getShortDescription(shortDescription, brand, searchColorName, gender, activityGroup, collection, material, materialLocal, upperMaterial,
+    midSoleMaterial, outerSoleMaterial, shellMaterial, toeType, heelType, fastener, fit, pumaTechnology, technologyPurpose, inputSheet, index, style);
+
+  var styleCount = styleCountMap[style];
+  sortChildIndexBasedOnSize(childUpdateIndexMap, styleCount, i, index);
+
+  fillDefaultValues(main, index, amountMapValue);
+  var templateAttributeValueList = getTemplateAttribute1();
+  var sizeChartKey = ageGroup + "-" + gender + "-" + articleGroup + "-" + articleType;
+  var templateAttributeValue = templateAttributeValueList[sizeChartKey];
+  var templateAttribute1 = "", templateAttribute4 = "", templateAttribute5 = "";
+  if (templateAttributeValue != "" && templateAttributeValue != undefined) {
+    templateAttribute1 = templateAttributeValue[1];
+  }
+  if (care != "" && care != undefined) templateAttribute4 += "<p><strong>Care:</strong>" + care + "<p>";
+  if (careLabel != "" && careLabel != undefined) templateAttribute4 += "<p><strong>Care Label:</strong>" + careLabel + "<p>";
+
+  fillTempateAttributes(main, templateAttribute1, templateAttribute4, templateAttribute5, index, longDescription);
+
+  main.getRange(index, 19).setValue(0);
+  if (styleCountMap[style] > 1) {
+    main.getRange(index, 4).setValue(style);
+    main.getRange(index, 9).setValue(styleCount);
+    main.getRange(index, 10).setValue("color_family");
+    main.getRange(index, 11).setValue("size");
+  } else {
+    main.getRange(index, 4).setValue(customSku);
+  }
+  main.getRange(index, 13).setValue("<ul>" + replaceSplCharacter(shortDescrition) + "</ul>");
+  main.getRange(index, 23).setValue(brand);
+  main.getRange(index, 24).setValue(style);
+
+  // req #4: resolved image URL copied straight across for the parent row too.
+  var resolvedImage = inputSheet.getRange(i, IMAGE_RESOLVED_COL).getValue();
+  if (resolvedImage) {
+    main.getRange(index, 20).setValue(resolvedImage);
+  }
+}
+
+function sortChildIndexBasedOnSize(childUpdateIndexMap, styleCount, j, index) {
+  var inputSheet = SpreadsheetApp.getActive().getSheetByName("Input");
+  var childEndIndex = j + styleCount - 1;
+  var sizeValues = inputSheet.getRange("L" + j + ":V" + childEndIndex).getValues();
+  var tempArray = [], childArray = [], colourArray = [], colourValueCountMap = {}, customSKUArray = [], parentQuantity = 0;
+
+  for (var i = 0; i < sizeValues.length; i++) {
+    var rowIndex = i + j;
+    if (isRowSkipped(inputSheet, rowIndex)) continue; // honor skip flags in sizing too
+
+    var value1 = sizeValues[i];
+    var sizeValue = getEffectiveSize(inputSheet, rowIndex);
+    if (!sizeValue) continue;
+    sizeValue = sizeValue.replace("UK:", "").replace("FR:", "").replace("US:", "").replace("ASIA:", "").replace("Int:", "").replace(" yrs", "Y");
+    if (sizeValue.indexOf(" L") != -1) {
+      sizeValue = sizeValue.replace("Int:W", "").replace("Int:", "").replace("W", "").replace(" L", "/");
+    }
+
+    var customSKU = value1[4];
+    var colour = value1[0];
+    parentQuantity += value1[5];
+    customSKUArray.push(customSKU);
+    if (tempArray.indexOf(sizeValue) == -1) tempArray.push(sizeValue);
+    childArray.push(sizeValue);
+    colourArray.push(colour);
+    colourValueCountMap[colour] = (colourValueCountMap[colour] || 0) + 1;
+  }
+
+  var sortByStringValue = ["3XS", "XXXS", "XXS", "XS", "S", "S/M", "M", "M/L", "L", "L/XL", "XL", "XXL", "XXXL", "3XL", "4XL", "5XL", "6XL",
+    "1-2Y", "2-3Y", "3-4Y", "4-5Y", "5-6Y", "6-7Y", "7-8Y", "8-9Y", "9-10Y", "10-11Y", "11-12Y", "12-13Y", "13-14Y", "14-15Y", "15-16Y",
+    "6Y", "8Y", "10Y", "12Y", "14Y", "16Y", "18Y", "20Y", "OSFA", "One size", "UA", "Mini", "Kids", "Adult", "Youth"]
+    .some(s => childArray.indexOf(s) != -1);
+
+  if (sortByStringValue) {
+    sortByStringValues(childArray, tempArray, customSKUArray, childUpdateIndexMap, colourArray, colourValueCountMap);
+  } else {
+    tempArray.sort((a, b) => (isNaN(a) && isNaN(b)) ? a.localeCompare(b) : a - b);
+    sortByIntValues(childArray, tempArray, customSKUArray, childUpdateIndexMap, colourArray, colourValueCountMap);
+  }
+  return parentQuantity;
+}
+
+function sortByIntValues(childArray, tempArray, customSKUArray, childUpdateIndexMap, colourArray, colourValueCountMap) {
+  var colourSizeMap = [], availableColour = [];
+  for (var i = 0; i < childArray.length; i++) {
+    var colour = colourArray[i];
+    if (availableColour.indexOf(colour) == -1) availableColour.push(colour);
+    colourSizeMap.push(colour + "_" + childArray[i]);
+  }
+  var colourCount = 0;
+  for (var i = 0; i < availableColour.length; i++) {
+    for (var j = 0; j < tempArray.length; j++) {
+      var key = availableColour[i] + "_" + tempArray[j];
+      if (colourSizeMap.indexOf(key) != -1) {
+        childUpdateIndexMap[key] = colourCount;
+        colourCount++;
+      }
+    }
+  }
+}
+
+function sortByStringValues(childArray, tempArray, customSKUArray, childUpdateIndexMap, colourArray, colourValueCountMap) {
+  var colourSizeMap = [], availableColour = [];
+  for (var i = 0; i < childArray.length; i++) {
+    var colour = colourArray[i];
+    if (availableColour.indexOf(colour) == -1) availableColour.push(colour);
+    colourSizeMap.push(colour + "_" + childArray[i]);
+  }
+  var loopSize = ["3XS", "XXXS", "XXS", "XS", "S", "S/M", "M", "M/L", "L", "L/XL", "XL", "XXL", "XXXL", "3XL", "4XL", "5XL", "6XL",
+    "1-2Y", "2-3Y", "3-4Y", "4-5Y", "5-6Y", "6-7Y", "7-8Y", "8-9Y", "9-10Y", "10-11Y", "11-12Y", "12-13Y", "13-14Y", "14-15Y", "15-16Y",
+    "16-17Y", "17-18Y", "18-19Y", "19-20Y", "6Y", "8Y", "10Y", "12Y", "14Y", "16Y", "18Y", "20Y", "OSFA", "One size", "UA", "Mini", "Kids", "Adult", "Youth"];
+  var colourCount = 0;
+  for (var i = 0; i < availableColour.length; i++) {
+    for (var j = 0; j < loopSize.length; j++) {
+      var key = availableColour[i] + "_" + loopSize[j];
+      if (colourSizeMap.indexOf(key) != -1) {
+        childUpdateIndexMap[key] = colourCount;
+        colourCount++;
+      }
+    }
+  }
+}
+
+function getTemplateAttribute1() {
+  var sizeChartMap = {};
+  var sizeChartSheet = SpreadsheetApp.getActive().getSheetByName("Size chart");
+  var values = sizeChartSheet.getRange("A2:B" + sizeChartSheet.getLastRow()).getValues();
+  for (var i = 0; i < values.length; i++) {
+    sizeChartMap[values[i][0]] = values[i];
+  }
+  return sizeChartMap;
+}
+
+function removeDuplicates(title) {
+  var str = title.split(" ");
+  var result = [];
+  for (var i = 0; i < str.length; i++) {
+    if (result.indexOf(str[i]) === -1) result.push(str[i]);
+  }
+  return result.join(" ");
+}
+
+function fillTempateAttributes(main, templateAttribute1, templateAttribute4, templateAttribute5, index, longDescription) {
+  var templateAttribute2 = "", templateAttribute3 = "";
+  longDescription = longDescription || ""; // req #1: tolerate blank description safely
+
+  if (longDescription.includes("FEATURES")) {
+    templateAttribute2 = longDescription.substring(longDescription.indexOf("<p>"), longDescription.indexOf("FEATURES"));
+    templateAttribute3 = longDescription.substring(longDescription.indexOf("FEATURES"));
+  } else if (longDescription.includes("DETAILS")) {
+    templateAttribute2 = longDescription.substring(longDescription.indexOf("<p>"), longDescription.indexOf("DETAILS"));
+    templateAttribute3 = longDescription.substring(longDescription.indexOf("DETAILS"));
+  } else if (longDescription.indexOf("<p>") !== -1) {
+    templateAttribute2 = longDescription.substring(longDescription.indexOf("<p>"));
+  }
+
+  main.getRange(index, 56).setValue("sizechart=" + templateAttribute1);
+  if (templateAttribute2 != "") main.getRange(index, 57).setValue("description=" + replaceSplCharacter(templateAttribute2).replace("<h3>", ""));
+  if (templateAttribute3 != "") main.getRange(index, 58).setValue("productstory=<h3>" + replaceSplCharacter(templateAttribute3));
+  if (templateAttribute4 != "") main.getRange(index, 59).setValue("care=" + replaceSplCharacter(templateAttribute4));
+}
+
+function capitalizeFirstLetters(str) {
+  var strVal = '';
+  str = str.split(' ');
+  for (var chr = 0; chr < str.length; chr++) {
+    strVal += str[chr].substring(0, 1).toUpperCase() + str[chr].substring(1) + ' ';
+  }
+  return strVal;
+}
+
+function constructAmountMap() {
+  var amountMap = {};
+  var priceSheet = SpreadsheetApp.getActive().getSheetByName("Price Sheet");
+  var values = priceSheet.getRange("A2:E" + priceSheet.getLastRow()).getValues();
+  for (var i = 0; i < values.length; i++) amountMap[values[i][2]] = values[i];
+  return amountMap;
+}
+
+function constructQuantityMap() {
+  var quantitytMap = {};
+  var quantitySheet = SpreadsheetApp.getActive().getSheetByName("Stock sheet");
+  var values = quantitySheet.getRange("A2:B" + quantitySheet.getLastRow()).getValues();
+  for (var i = 0; i < values.length; i++) quantitytMap[values[i][0]] = values[i];
+  return quantitytMap;
+}
+
+function constructCategoryMap() {
+  var categoryMap = {};
+  var categorySheet = SpreadsheetApp.getActive().getSheetByName("Category sheet");
+  var values = categorySheet.getRange("A2:C" + categorySheet.getLastRow()).getValues();
+  for (var i = 0; i < values.length; i++) categoryMap[values[i][0]] = values[i];
+  return categoryMap;
+}
+
+function createHeadingForTargetSheet(target) {
+  var headings = ["SKU", "status", "errorDetails", "customSKU", "itemTitle", "itemDescription1", "itemDescription2", "itemDescription3", "noOfVariants", "variation1", "variation2", "variation3", "shortDescription", "salePrice", "saleStartDate", "saleEndDate", "itemAmount", "currencyCode", "noOfItem", "imageURI", "categoryID", "taxClass", "brand", "model", "warrantyType", "packageWeight(kg)", "packageHeight(cm)", "packageLength(cm)", "packageWidth(cm)", "packageContent", "itemSpecifics1", "itemSpecifics2", "itemSpecifics3", "itemSpecifics4", "itemSpecifics5", "itemSpecifics6", "itemSpecifics7", "itemSpecifics8", "itemSpecifics9", "itemSpecifics10", "itemSpecifics11", "itemSpecifics12", "itemSpecifics13", "itemSpecifics14", "itemSpecifics15", "itemSpecifics16", "itemSpecifics17", "itemSpecifics18", "itemSpecifics19", "itemSpecifics20", "itemSpecifics21", "itemSpecifics22", "itemSpecifics23", "itemSpecifics24", "itemSpecifics25", "templateAttribute1", "templateAttribute2", "templateAttribute3", "templateAttribute4", "templateAttribute5", "postAsNonVariant"];
+  for (var i = 0; i < headings.length; i++) target.getRange(1, i + 1).setValue(headings[i]);
+}
+
+/* -------------------------------------------------------------------------------------
+ * populateSizeData / populateColorDataFromColorExport / populateStyleDataFromStyleExport
+ * kept functionally the same as original (input-side raw export ingestion), with the
+ * duplicate populateStyleDataFromStyleExport() definition removed (the original file
+ * defined it twice — only the second, correct version using "Style no." is kept).
+ * ------------------------------------------------------------------------------------- */
+
+function populateSizeData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sizeSheet = ss.getSheetByName("Size Export");
+  const inputSheet = ss.getSheetByName("Input") || ss.insertSheet("Input");
+  if (!sizeSheet) throw new Error("Size Export sheet not found");
+
+  const data = sizeSheet.getDataRange().getValues();
+  const header = data.shift();
+  const eanIndex = header.findIndex(h => h && h.toString().trim().toLowerCase() === "ean");
+  const colorNoIndex = header.findIndex(h => h && h.toString().trim().toLowerCase() === "color no");
+  const UKSizeIndex = header.findIndex(h => h && h.toString().trim().toLowerCase() === "print size code (uk)");
+  const FRSizeIndex = header.findIndex(h => h && h.toString().trim().toLowerCase() === "print size code (fr)");
+  const USASizeIndex = header.findIndex(h => h && h.toString().trim().toLowerCase() === "print size code (usa)");
+  const INTSizeIndex = header.findIndex(h => h && h.toString().trim().toLowerCase() === "print size code (int)");
+  if (eanIndex === -1 || colorNoIndex === -1) throw new Error("EAN or Color No column not found in Size Export");
+
+  const output = [];
+  data.forEach(row => {
+    const outRow = new Array(23).fill("");
+    outRow[0] = row[colorNoIndex] || "";
+    outRow[15] = row[eanIndex] || "";
+    outRow[19] = row[USASizeIndex] || "";
+    outRow[20] = row[FRSizeIndex] || "";
+    outRow[21] = row[UKSizeIndex] || "";
+    outRow[22] = row[INTSizeIndex] || "";
+    output.push(outRow);
+  });
+
+  inputSheet.getRange(2, 1, output.length, 23).setValues(output);
+  inputSheet.getRange("A1").setValue("Style no.");
+  inputSheet.getRange("P1").setValue("EAN");
+  inputSheet.getRange("T1").setValue("SizeUS");
+  inputSheet.getRange("U1").setValue("SizeFR");
+  inputSheet.getRange("V1").setValue("SizeUK");
+  inputSheet.getRange("W1").setValue("SizeASIA");
+  SpreadsheetApp.flush();
+}
+
+function populateColorDataFromColorExport() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const inputSheet = ss.getSheetByName("Input");
+  const colorSheet = ss.getSheetByName("Color Export");
+  if (!inputSheet || !colorSheet) throw new Error("Input sheet or Color Export sheet not found");
+
+  const norm = v => v ? v.toString().trim().toLowerCase() : "";
+  const findIndex = (header, name) => header.findIndex(h => norm(h) === norm(name));
+
+  const inputData = inputSheet.getDataRange().getValues();
+  const inputHeader = inputData[0];
+  const styleNoIdx = findIndex(inputHeader, "Style no.");
+  if (styleNoIdx === -1) throw new Error("StyleNo column not found in Input sheet");
+
+  const colorData = colorSheet.getDataRange().getValues();
+  const colorHeader = colorData.shift();
+  const colorStyleNoIdx = findIndex(colorHeader, "Color No");
+  if (colorStyleNoIdx === -1) throw new Error("Style No column not found in Color Export sheet");
+
+  const colorMap = {};
+  colorData.forEach(row => {
+    const key = norm(row[colorStyleNoIdx]);
+    if (key) colorMap[key] = row;
+  });
+
+  const columnMapping = [
+    { inputCol: 9, colorCol: "Color No" },
+    { inputCol: 12, colorCol: "Color Name" },
+    { inputCol: 13, colorCol: "Search Color Name" },
+    { inputCol: 29, colorCol: "Upper (English (UK))" },
+    { inputCol: 30, colorCol: "Mid Sole (English (UK))" },
+    { inputCol: 31, colorCol: "Outer Sole (English (UK))" },
+    { inputCol: 41, colorCol: "Pattern" }
+  ];
+  columnMapping.forEach(m => {
+    m.colorIdx = findIndex(colorHeader, m.colorCol);
+    if (m.colorIdx === -1) throw new Error(`Column "${m.colorCol}" not found in Color Export`);
+  });
+
+  for (let r = 1; r < inputData.length; r++) {
+    const styleNo = norm(inputData[r][styleNoIdx]);
+    const colorRow = colorMap[styleNo];
+    if (!colorRow) continue;
+    columnMapping.forEach(m => {
+      inputData[r][m.inputCol - 1] = colorRow[m.colorIdx] || "";
+    });
+  }
+
+  inputSheet.getRange(1, 1, inputData.length, inputData[0].length).setValues(inputData);
+  SpreadsheetApp.flush();
+}
+
+function populateStyleDataFromStyleExport() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const inputSheet = ss.getSheetByName("Input");
+  const styleSheet = ss.getSheetByName("Style Export");
+  if (!inputSheet || !styleSheet) throw new Error("Input sheet or Style Export sheet not found");
+
+  const norm = v => v ? v.toString().trim().toLowerCase() : "";
+  const findIndex = (header, name) => header.findIndex(h => norm(h) === norm(name));
+
+  const inputData = inputSheet.getDataRange().getValues();
+  const inputHeader = inputData[0];
+  const styleNoIdx = findIndex(inputHeader, "Style no.");
+  if (styleNoIdx === -1) throw new Error("StyleNo column not found in Input sheet");
+
+  const styleData = styleSheet.getDataRange().getValues();
+  const styleHeader = styleData.shift();
+  const styleExportStyleNoIdx = findIndex(styleHeader, "Style no.");
+  if (styleExportStyleNoIdx === -1) throw new Error("Style no column not found in Style Export sheet");
+
+  const styleMap = {};
+  styleData.forEach(row => {
+    const key = norm(row[styleExportStyleNoIdx]);
+    if (key) styleMap[key] = row;
+  });
+
+  const columnMapping = [
+    { inputCol: 1, styleCol: "Style no." },
+    { inputCol: 3, styleCol: "Brand" },
+    { inputCol: 4, styleCol: "Age Group" },
+    { inputCol: 5, styleCol: "Gender" },
+    { inputCol: 6, styleCol: "Article Group" },
+    { inputCol: 7, styleCol: "Article Type" },
+    { inputCol: 8, styleCol: "Activity Group" },
+    { inputCol: 14, styleCol: "Product Division" },
+    { inputCol: 26, styleCol: "Collection" },
+    { inputCol: 27, styleCol: "Material" },
+    { inputCol: 28, styleCol: "Material (English)" },
+    { inputCol: 34, styleCol: "Heel Type" },
+    { inputCol: 35, styleCol: "Puma Technology" },
+    { inputCol: 36, styleCol: "Technology Purpose" },
+    { inputCol: 42, styleCol: "Dimensions Accessories" },
+    { inputCol: 66, styleCol: "Fastener" },
+    { inputCol: 67, styleCol: "Fit" },
+    { inputCol: 68, styleCol: "Notes (SEA)" },
+    { inputCol: 69, styleCol: "Body Style 1" },
+    { inputCol: 70, styleCol: "Body Style 2" }
+    // NOTE: Regional Display Name / Short Description / Long Description columns are
+    // intentionally handled by resolveTitleAndDescriptionForSheet() (req #1) instead,
+    // so they are removed from this mapping to avoid being overwritten afterward.
+  ];
+  columnMapping.forEach(m => {
+    m.styleIdx = findIndex(styleHeader, m.styleCol);
+    if (m.styleIdx === -1) throw new Error(`Column "${m.styleCol}" not found in Style Export`);
+  });
+
+  for (let r = 1; r < inputData.length; r++) {
+    const rawStyleNo = inputData[r][styleNoIdx];
+    if (!rawStyleNo) continue;
+    const lookupKey = norm(rawStyleNo.toString());
+    const styleRow = styleMap[lookupKey];
+    if (!styleRow) continue;
+    columnMapping.forEach(m => {
+      inputData[r][m.inputCol - 1] = styleRow[m.styleIdx] || "";
+    });
+  }
+
+  inputSheet.getRange(1, 1, inputData.length, inputData[0].length).setValues(inputData);
+  SpreadsheetApp.flush();
+}
